@@ -169,6 +169,10 @@ defmodule StoreMemories do
           data: %{
             type: "string",
             description: "The information to remember"
+          },
+          overwrite: %{
+            type: "boolean",
+            description: "Set to true to overwrite an existing memory with the same label"
           }
         }
       }
@@ -176,9 +180,11 @@ defmodule StoreMemories do
   end
 
   @impl true
-  def call(%{"label" => label, "data" => data}) do
+  def call(%{"label" => label, "data" => data} = args) do
+    overwrite = Map.get(args, "overwrite", false)
+
     with {:ok, store_id} <- State.store_id(),
-         :ok <- Store.write(store_id, label, data) do
+         :ok <- Store.write(store_id, label, data, overwrite: overwrite) do
       {:ok, "'#{label}' has been remembered"}
     end
   end
@@ -321,14 +327,16 @@ defmodule Embeddings do
     )
   end
 
-  # Computes cosine similarity between two strings. Returns {:ok, score} where
-  # score is a float typically between 0.0 and 1.0.
-  def similarity(a, b) do
-    case Nx.Serving.batched_run(@serving_name, [a, b]) do
-      [%{embedding: e1}, %{embedding: e2}] -> {:ok, cosine_similarity(e1, e2)}
+  # Embeds a single string, returns {:ok, tensor}.
+  def embed(text) do
+    case Nx.Serving.batched_run(@serving_name, text) do
+      %{embedding: embedding} -> {:ok, embedding}
       error -> {:error, error}
     end
   end
+
+  # Cosine similarity between two pre-computed embedding tensors.
+  def tensor_similarity(e1, e2), do: cosine_similarity(e1, e2)
 
   defp cosine_similarity(e1, e2) do
     e1 = Nx.flatten(e1)
@@ -394,6 +402,7 @@ defmodule Store do
     |> path()
     |> ensure()
     |> File.ls!()
+    |> Enum.filter(&String.ends_with?(&1, ".md"))
     |> Enum.map(&String.replace_suffix(&1, ".md", ""))
   end
 
@@ -401,19 +410,36 @@ defmodule Store do
     File.exists?(path(id, slug))
   end
 
-  def write(id, label, data) do
+  def write(id, label, data, opts \\ []) do
     slug = slugify(label)
-    path(id) |> ensure()
-    File.write!(path(id, slug), "# #{label}\n\n#{data}")
+    overwrite = Keyword.get(opts, :overwrite, false)
+    content_path = path(id, slug)
+
+    if File.exists?(content_path) and not overwrite do
+      {:error, "A memory with label '#{label}' already exists. " <>
+        "Read it first, then decide whether to overwrite, merge, or create a separate memory. " <>
+        "Pass overwrite: true to replace it."}
+    else
+      path(id) |> ensure()
+      content = "# #{label}\n\n#{data}"
+      File.write!(content_path, content)
+
+      {:ok, embedding} = Embeddings.embed(content)
+      File.write!(embedding_path(id, slug), :erlang.term_to_binary(embedding))
+      :ok
+    end
   end
 
   def read(id, slug), do: File.read(path(id, slug))
 
   def search(id, query, max_results \\ @max_results) do
+    {:ok, query_embedding} = Embeddings.embed(query)
+
     list_entries(id)
     |> Task.async_stream(fn slug ->
       with {:ok, entry} <- read(id, slug),
-           {:ok, score} <- Embeddings.similarity(query, entry) do
+           {:ok, embedding} <- read_embedding(id, slug) do
+        score = Embeddings.tensor_similarity(query_embedding, embedding)
         {:ok, score, entry}
       else
         {:error, reason} ->
@@ -422,15 +448,8 @@ defmodule Store do
       end
     end)
     |> Enum.reduce([], fn
-      {:ok, {:ok, score, entry}}, acc ->
-        [{score, entry} | acc]
-
-      nil, acc ->
-        acc
-
-      {:error, reason}, acc ->
-        App.log(:error, "Error processing entry", reason)
-        acc
+      {:ok, {:ok, score, entry}}, acc -> [{score, entry} | acc]
+      _, acc -> acc
     end)
     |> Enum.sort_by(&elem(&1, 0), :desc)
     |> Enum.take(max_results)
@@ -444,9 +463,18 @@ defmodule Store do
     |> String.replace(~r/[\s_]+/, "-")
   end
 
+  defp read_embedding(id, slug) do
+    case File.read(embedding_path(id, slug)) do
+      {:ok, binary} -> {:ok, :erlang.binary_to_term(binary)}
+      {:error, :enoent} -> {:error, "No embedding found for '#{slug}'"}
+      error -> error
+    end
+  end
+
   defp path(), do: [System.user_home!(), ".config", "engram"] |> Path.join()
   defp path(id), do: path() |> Path.join(id)
   defp path(id, slug), do: Path.join(path(id), slug <> ".md")
+  defp embedding_path(id, slug), do: Path.join(path(id), slug <> ".embedding")
 
   defp ensure(path) do
     File.mkdir_p!(path)
