@@ -13,7 +13,8 @@ cfg = Map.update!(cfg, :config, &Map.put(&1, :type, :standard_error))
 # Install dependencies
 #-------------------------------------------------------------------------------
 Mix.install([
-  {:alike, "~> 0.4.2"},
+  {:bumblebee, "~> 0.6"},
+  {:exla, "~> 0.9"},
   {:jason, "~> 1.4"},
   {:uniq, "~> 0.1"},
 ])
@@ -36,11 +37,7 @@ end
 # MCP Server implementation (stdio)
 #-------------------------------------------------------------------------------
 defmodule McpServer do
-  #@jsonrpc_invalid_request -32600
-  #@jsonrpc_method_not_found -32601
   @jsonrpc_invalid_params -32602
-  #@jsonrpc_internal_error -32603
-  #@jsonrpc_parse_error -32700
 
   @service %{
     protocolVersion: "2024-11-05",
@@ -59,32 +56,18 @@ defmodule McpServer do
 
   defp loop do
     case IO.read(:stdio, :line) do
-      :eof ->
-        :ok
-
-      {:error, reason} ->
-        App.log(:error, "error reading from stdin", reason)
-        :ok
-
-      "\n" ->
-        loop()
+      :eof -> :ok
+      "\n" -> loop()
+      {:error, reason} -> App.log(:error, "error reading from stdin", reason)
 
       line ->
         line
         |> String.trim()
         |> Jason.decode()
         |> case do
-          {:ok, nil} ->
-            :ok
-
-          {:ok, msg} ->
-            handle_request(msg)
-
-          {:error, reason} ->
-            App.log(:error, "error parsing request", %{
-              input: line,
-              message: reason
-            })
+          {:ok, nil} -> :ok
+          {:ok, msg} -> handle_request(msg)
+          {:error, reason} -> App.log(:error, "error parsing request", %{input: line, message: reason})
         end
 
         loop()
@@ -94,7 +77,6 @@ defmodule McpServer do
   #-----------------------------------------------------------------------------
   # Message handling
   #-----------------------------------------------------------------------------
-
   # Notifications have no id and receive no response
   defp handle_request(%{"method" => "notifications/" <> _}), do: :ok
 
@@ -103,14 +85,9 @@ defmodule McpServer do
     method
     |> handle_method(msg)
     |> case do
-      {:ok, result} ->
-        reply(id, result)
-
-      {:error, code, reason} ->
-        fail(id, code, reason)
-
-      {:tool_error, reason} ->
-        reply(id, %{content: [%{type: "text", text: reason}], isError: true})
+      {:ok, result} -> reply(id, result)
+      {:error, code, reason} -> fail(id, code, reason)
+      {:tool_error, reason} -> reply(id, %{content: [%{type: "text", text: reason}], isError: true})
     end
   end
 
@@ -142,15 +119,8 @@ defmodule McpServer do
   #-----------------------------------------------------------------------------
   # Communication helpers
   #-----------------------------------------------------------------------------
-  defp reply(id, result) do
-    %{id: id, result: result}
-    |> write()
-  end
-
-  defp fail(id, code, message) do
-    %{id: id, error: %{code: code, message: message}}
-    |> write()
-  end
+  defp reply(id, result), do: %{id: id, result: result} |> write()
+  defp fail(id, code, message), do: %{id: id, error: %{code: code, message: message}} |> write()
 
   defp write(%{} = msg) do
     msg
@@ -308,25 +278,72 @@ defmodule App do
   end
 
   def debug(msg), do: log(:debug, msg)
-  def info(msg), do: log(:info, msg)
-  def error(msg), do: log(:error, msg)
-  def warn(msg), do: log(:warn, msg)
-
   def debug(msg, extra), do: log(:debug, msg, extra)
+  def info(msg), do: log(:info, msg)
   def info(msg, extra), do: log(:info, msg, extra)
+  def error(msg), do: log(:error, msg)
   def error(msg, extra), do: log(:error, msg, extra)
+  def warn(msg), do: log(:warn, msg)
   def warn(msg, extra), do: log(:warn, msg, extra)
 end
 
 #-------------------------------------------------------------------------------
 # Contexts
 #-------------------------------------------------------------------------------
+defmodule Embeddings do
+  @model "sentence-transformers/all-MiniLM-L12-v2"
+  @serving_name __MODULE__
+
+  # Loads the embedding model and tokenizer from HuggingFace, then starts an
+  # Nx.Serving process for batched inference. Must be called before
+  # similarity/2.
+  def start do
+    App.log(:info, "Loading embedding model #{@model}...")
+
+    {:ok, model} = Bumblebee.load_model({:hf, @model})
+    {:ok, tokenizer} = Bumblebee.load_tokenizer({:hf, @model})
+
+    serving =
+      Bumblebee.Text.TextEmbedding.text_embedding(
+        model,
+        tokenizer,
+        compile: [batch_size: 2, sequence_length: 128],
+        defn_options: [compiler: EXLA],
+        output_pool: :mean_pooling,
+        output_attribute: :hidden_state
+      )
+
+    Nx.Serving.start_link(
+      serving: serving,
+      name: @serving_name,
+      batch_size: 2,
+      batch_timeout: 100
+    )
+  end
+
+  # Computes cosine similarity between two strings. Returns {:ok, score} where
+  # score is a float typically between 0.0 and 1.0.
+  def similarity(a, b) do
+    case Nx.Serving.batched_run(@serving_name, [a, b]) do
+      [%{embedding: e1}, %{embedding: e2}] -> {:ok, cosine_similarity(e1, e2)}
+      error -> {:error, error}
+    end
+  end
+
+  defp cosine_similarity(e1, e2) do
+    e1 = Nx.flatten(e1)
+    e2 = Nx.flatten(e2)
+
+    Nx.divide(Nx.dot(e1, e2), Nx.multiply(Nx.LinAlg.norm(e1), Nx.LinAlg.norm(e2)))
+    |> Nx.to_number()
+  end
+end
+
 defmodule State do
   use Agent
 
-  def start_link() do
-    Agent.start_link(fn -> %{} end, name: __MODULE__)
-  end
+  def start_link(), do: Agent.start_link(fn -> %{} end, name: __MODULE__)
+  def store_id(id), do: Agent.update(__MODULE__, &Map.put(&1, :store_id, id))
 
   def store_id() do
     Agent.get(__MODULE__, &Map.get(&1, :store_id))
@@ -335,18 +352,12 @@ defmodule State do
       id -> {:ok, id}
     end
   end
-
-  def store_id(id) do
-    Agent.update(__MODULE__, &Map.put(&1, :store_id, id))
-  end
 end
 
 defmodule Store do
   @max_results 10
 
-  def init() do
-    path() |> ensure()
-  end
+  def init(), do: path() |> ensure()
 
   def init(id) do
     init()
@@ -358,9 +369,7 @@ defmodule Store do
     end
   end
 
-  def store_exists?(id) do
-    path(id) |> File.dir?()
-  end
+  def store_exists?(id), do: path(id) |> File.dir?()
 
   def new_store() do
     uuid = Uniq.UUID.uuid4()
@@ -398,15 +407,13 @@ defmodule Store do
     File.write!(path(id, slug), "# #{label}\n\n#{data}")
   end
 
-  def read(id, slug) do
-    File.read(path(id, slug))
-  end
+  def read(id, slug), do: File.read(path(id, slug))
 
   def search(id, query, max_results \\ @max_results) do
     list_entries(id)
     |> Task.async_stream(fn slug ->
       with {:ok, entry} <- read(id, slug),
-           {:ok, score} <- Alike.similarity(query, entry) do
+           {:ok, score} <- Embeddings.similarity(query, entry) do
         {:ok, score, entry}
       else
         {:error, reason} ->
@@ -521,8 +528,7 @@ case args do
       :ok ->
         App.info("Using store with ID: #{id}")
         Nx.global_default_backend(EXLA.Backend)
-        Application.put_env(:alike, :embedding_model, "sentence-transformers/all-MiniLM-L12-v2")
-        Alike.start()
+        Embeddings.start()
         McpServer.run()
 
       {:error, reason} ->
