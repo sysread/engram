@@ -1,0 +1,535 @@
+#!/usr/bin/env elixir
+
+#-------------------------------------------------------------------------------
+# Initialize logger
+#-------------------------------------------------------------------------------
+{:ok, cfg} = :logger.get_handler_config(:default)
+cfg = Map.update!(cfg, :config, &Map.put(&1, :type, :standard_error))
+:ok = :logger.remove_handler(:default)
+:ok = :logger.add_handler(:default, :logger_std_h, cfg)
+:ok = :logger.set_primary_config(:level, :info)
+
+#-------------------------------------------------------------------------------
+# Install dependencies
+#-------------------------------------------------------------------------------
+Mix.install([
+  {:alike, "~> 0.4.2"},
+  {:jason, "~> 1.4"},
+  {:uniq, "~> 0.1"},
+])
+
+#-------------------------------------------------------------------------------
+# Tool behaviour
+#-------------------------------------------------------------------------------
+defmodule McpTool do
+  @type tool_spec :: %{
+    name: binary,
+    description: binary,
+    inputSchema: map
+  }
+
+  @callback spec() :: tool_spec
+  @callback call(map) :: {:ok, binary} | {:error, binary}
+end
+
+#-------------------------------------------------------------------------------
+# MCP Server implementation (stdio)
+#-------------------------------------------------------------------------------
+defmodule McpServer do
+  #@jsonrpc_invalid_request -32600
+  #@jsonrpc_method_not_found -32601
+  @jsonrpc_invalid_params -32602
+  #@jsonrpc_internal_error -32603
+  #@jsonrpc_parse_error -32700
+
+  @service %{
+    protocolVersion: "2024-11-05",
+    serverInfo: %{name: "engram", version: "0.1.0"},
+    capabilities: %{tools: %{}}
+  }
+
+  #-----------------------------------------------------------------------------
+  # Main loop
+  #-----------------------------------------------------------------------------
+  def run do
+    App.log(:info, "Tools: #{inspect(tools_map(), pretty: true, limit: :infinity)}")
+    App.log(:info, "Engram ready")
+    loop()
+  end
+
+  defp loop do
+    case IO.read(:stdio, :line) do
+      :eof ->
+        :ok
+
+      {:error, reason} ->
+        App.log(:error, "error reading from stdin", reason)
+        :ok
+
+      "\n" ->
+        loop()
+
+      line ->
+        line
+        |> String.trim()
+        |> Jason.decode()
+        |> case do
+          {:ok, nil} ->
+            :ok
+
+          {:ok, msg} ->
+            handle_request(msg)
+
+          {:error, reason} ->
+            App.log(:error, "error parsing request", %{
+              input: line,
+              message: reason
+            })
+        end
+
+        loop()
+    end
+  end
+
+  #-----------------------------------------------------------------------------
+  # Message handling
+  #-----------------------------------------------------------------------------
+
+  # Notifications have no id and receive no response
+  defp handle_request(%{"method" => "notifications/" <> _}), do: :ok
+
+  # Requests have an id and always receive a response
+  defp handle_request(%{"id" => id, "method" => method} = msg) do
+    method
+    |> handle_method(msg)
+    |> case do
+      {:ok, result} ->
+        reply(id, result)
+
+      {:error, code, reason} ->
+        fail(id, code, reason)
+
+      {:tool_error, reason} ->
+        reply(id, %{content: [%{type: "text", text: reason}], isError: true})
+    end
+  end
+
+  defp handle_method("initialize", _), do: {:ok, @service}
+
+  defp handle_method("tools/list", _) do
+    tools()
+    |> Enum.map(& &1.spec())
+    |> then(&{:ok, %{tools: &1}})
+  end
+
+  defp handle_method("tools/call", %{"params" => %{"name" => name} = params}) do
+    tools_map()
+    |> Map.get(name)
+    |> case do
+      nil ->
+        {:error, @jsonrpc_invalid_params, "Unknown tool: #{name}"}
+
+      tool ->
+        args = Map.get(params, "arguments", %{})
+
+        case tool.call(args) do
+          {:ok, text} -> {:ok, %{content: [%{type: "text", text: text}]}}
+          {:error, reason} -> {:tool_error, reason}
+        end
+    end
+  end
+
+  #-----------------------------------------------------------------------------
+  # Communication helpers
+  #-----------------------------------------------------------------------------
+  defp reply(id, result) do
+    %{id: id, result: result}
+    |> write()
+  end
+
+  defp fail(id, code, message) do
+    %{id: id, error: %{code: code, message: message}}
+    |> write()
+  end
+
+  defp write(%{} = msg) do
+    msg
+    |> Map.put(:jsonrpc, "2.0")
+    |> Jason.encode!()
+    |> then(&(&1 <> "\n"))
+    |> IO.write()
+  end
+
+  #-----------------------------------------------------------------------------
+  # Tool discovery
+  #-----------------------------------------------------------------------------
+  defp tools do
+    :code.all_loaded()
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.filter(&function_exported?(&1, :spec, 0))
+    |> Enum.filter(&function_exported?(&1, :call, 1))
+  end
+
+  defp tools_map do
+    tools()
+    |> Enum.map(fn tool -> {tool.spec().name, tool} end)
+    |> Map.new()
+  end
+end
+
+#-------------------------------------------------------------------------------
+# Tools
+#-------------------------------------------------------------------------------
+defmodule StoreMemories do
+  @behaviour McpTool
+
+  @impl true
+  def spec() do
+    %{
+      name: "remember",
+      description: "Persists a piece of information in the current store",
+      inputSchema: %{
+        type: "object",
+        required: ["label", "data"],
+        properties: %{
+          label: %{
+            type: "string",
+            description: "A label for the information to remember"
+          },
+          data: %{
+            type: "string",
+            description: "The information to remember"
+          }
+        }
+      }
+    }
+  end
+
+  @impl true
+  def call(%{"label" => label, "data" => data}) do
+    with {:ok, store_id} <- State.store_id(),
+         :ok <- Store.write(store_id, label, data) do
+      {:ok, "'#{label}' has been remembered"}
+    end
+  end
+end
+
+defmodule ListMemories do
+  @behaviour McpTool
+
+  @impl true
+  def spec() do
+    %{
+      name: "list",
+      description: "Lists all entries in the current store",
+      inputSchema: %{
+        type: "object",
+        properties: %{}
+      }
+    }
+  end
+
+  @impl true
+  def call(_) do
+    with {:ok, store_id} <- State.store_id() do
+      Store.list_entries(store_id)
+      |> Enum.join("\n")
+      |> then(&{:ok, &1})
+    end
+  end
+end
+
+defmodule RecallMemories do
+  @behaviour McpTool
+
+  @impl true
+  def spec() do
+    %{
+      name: "recall",
+      description: "Recalls information from the current store relevant to a query",
+      inputSchema: %{
+        type: "object",
+        required: ["query"],
+        properties: %{
+          query: %{
+            type: "string",
+            description: "A query to recall relevant information for"
+          }
+        }
+      }
+    }
+  end
+
+  @impl true
+  def call(%{"query" => query}) do
+    with {:ok, store_id} <- State.store_id() do
+      Store.search(store_id, query)
+      |> Enum.map(fn {_score, entry} -> entry end)
+      |> Enum.join("\n\n-----\n\n")
+      |> then(&{:ok, &1})
+    end
+  end
+end
+
+#-------------------------------------------------------------------------------
+# Common app bits
+#-------------------------------------------------------------------------------
+defmodule App do
+  def help(exit_code \\ 0) do
+    IO.puts("""
+    Usage: engram [options]
+
+    Options:
+      --help    | -h  Show this help message
+      --verbose | -v  Enable verbose output
+      --store         Use the store with the given UUID
+
+    Operations:
+      --create        Create a new store with the given name
+      --list          List existing stores
+      --remove        Remove the store with the given ID
+
+    If no operation is specified, starts the MCP server using the stdio transport
+    with the specified store.
+    """)
+
+    System.halt(exit_code)
+  end
+
+  #-----------------------------------------------------------------------------
+  # Logging helpers
+  #-----------------------------------------------------------------------------
+  require Logger
+
+  def log(level, msg), do: Logger.log(level, msg)
+
+  def log(level, msg, extra) do
+    log(level, msg <> "\n\n" <> inspect(extra, pretty: true, limit: :infinity))
+  end
+
+  def debug(msg), do: log(:debug, msg)
+  def info(msg), do: log(:info, msg)
+  def error(msg), do: log(:error, msg)
+  def warn(msg), do: log(:warn, msg)
+
+  def debug(msg, extra), do: log(:debug, msg, extra)
+  def info(msg, extra), do: log(:info, msg, extra)
+  def error(msg, extra), do: log(:error, msg, extra)
+  def warn(msg, extra), do: log(:warn, msg, extra)
+end
+
+#-------------------------------------------------------------------------------
+# Contexts
+#-------------------------------------------------------------------------------
+defmodule State do
+  use Agent
+
+  def start_link() do
+    Agent.start_link(fn -> %{} end, name: __MODULE__)
+  end
+
+  def store_id() do
+    Agent.get(__MODULE__, &Map.get(&1, :store_id))
+    |> case do
+      nil -> {:error, :not_set}
+      id -> {:ok, id}
+    end
+  end
+
+  def store_id(id) do
+    Agent.update(__MODULE__, &Map.put(&1, :store_id, id))
+  end
+end
+
+defmodule Store do
+  @max_results 10
+
+  def init() do
+    path() |> ensure()
+  end
+
+  def init(id) do
+    init()
+
+    if store_exists?(id) do
+      :ok
+    else
+      {:error, "Store with ID '#{id}' does not exist"}
+    end
+  end
+
+  def store_exists?(id) do
+    path(id) |> File.dir?()
+  end
+
+  def new_store() do
+    uuid = Uniq.UUID.uuid4()
+    path(uuid) |> ensure()
+    {:ok, uuid}
+  end
+
+  def list_stores() do
+    path()
+    |> File.ls!()
+    |> Enum.filter(&store_exists?/1)
+    |> then(&{:ok, &1})
+  end
+
+  def remove_store(id) do
+    File.rm_rf!(path(id))
+    :ok
+  end
+
+  def list_entries(id) do
+    id
+    |> path()
+    |> ensure()
+    |> File.ls!()
+    |> Enum.map(&String.replace_suffix(&1, ".md", ""))
+  end
+
+  def entry_exists?(id, slug) do
+    File.exists?(path(id, slug))
+  end
+
+  def write(id, label, data) do
+    slug = slugify(label)
+    path(id) |> ensure()
+    File.write!(path(id, slug), "# #{label}\n\n#{data}")
+  end
+
+  def read(id, slug) do
+    File.read(path(id, slug))
+  end
+
+  def search(id, query, max_results \\ @max_results) do
+    list_entries(id)
+    |> Task.async_stream(fn slug ->
+      with {:ok, entry} <- read(id, slug),
+           {:ok, score} <- Alike.similarity(query, entry) do
+        {:ok, score, entry}
+      else
+        {:error, reason} ->
+          App.log(:error, "Error processing entry '#{slug}'", reason)
+          nil
+      end
+    end)
+    |> Enum.reduce([], fn
+      {:ok, {:ok, score, entry}}, acc ->
+        [{score, entry} | acc]
+
+      nil, acc ->
+        acc
+
+      {:error, reason}, acc ->
+        App.log(:error, "Error processing entry", reason)
+        acc
+    end)
+    |> Enum.sort_by(&elem(&1, 0), :desc)
+    |> Enum.take(max_results)
+  end
+
+  defp slugify(label) do
+    label
+    |> String.trim()
+    |> String.downcase()
+    |> String.replace(~r/[^a-z0-9\s_-]/, "")
+    |> String.replace(~r/[\s_]+/, "-")
+  end
+
+  defp path(), do: [System.user_home!(), ".config", "engram"] |> Path.join()
+  defp path(id), do: path() |> Path.join(id)
+  defp path(id, slug), do: Path.join(path(id), slug <> ".md")
+
+  defp ensure(path) do
+    File.mkdir_p!(path)
+    path
+  end
+end
+
+#-------------------------------------------------------------------------------
+# Process ARGV
+#-------------------------------------------------------------------------------
+args =
+  System.argv()
+  |> OptionParser.parse(
+    switches: [
+      help: :boolean,
+      verbose: :boolean,
+      create: :boolean,
+      list: :boolean,
+      remove: :boolean,
+      store: :string,
+    ],
+    aliases: [
+      h: :help,
+      v: :verbose,
+    ]
+  )
+  |> then(fn {args, _, _} -> args end)
+  |> Map.new()
+
+# Override logger level if --verbose is set
+if args[:verbose] do
+  :logger.set_primary_config(:level, :debug)
+end
+
+# Initialize store with store ID from args (if provided)
+State.start_link()
+
+if id = args[:store] do
+  State.store_id(id)
+end
+
+# Initialize store directory
+Store.init()
+
+#-------------------------------------------------------------------------------
+# Dispatch
+#-------------------------------------------------------------------------------
+case args do
+  %{help: true} ->
+    App.help(0)
+
+  %{create: name} ->
+    case Store.new_store() do
+      {:ok, id} -> App.info("Created new store '#{name}' with ID: #{id}")
+      {:error, reason} -> App.error("Error creating store: #{inspect(reason, pretty: true)}")
+    end
+
+  %{list: true} ->
+    case Store.list_stores() do
+      {:ok, []} ->
+        IO.puts("No stores found. Use --create to create a new store.")
+
+      {:ok, stores} ->
+        IO.puts("Existing stores:")
+        stores |> Enum.map(&("  - #{&1}")) |> Enum.each(&IO.puts/1)
+
+      {:error, reason} ->
+        App.error("Error listing stores: #{inspect(reason, pretty: true)}")
+    end
+
+  %{store: id, remove: true} ->
+    case Store.remove_store(id) do
+      :ok -> App.info("Removed store with ID: #{id}")
+      {:error, reason} -> App.error("Error removing store: #{inspect(reason, pretty: true)}")
+    end
+
+  %{store: id} ->
+    case Store.init(id) do
+      :ok ->
+        App.info("Using store with ID: #{id}")
+        Nx.global_default_backend(EXLA.Backend)
+        Application.put_env(:alike, :embedding_model, "sentence-transformers/all-MiniLM-L12-v2")
+        Alike.start()
+        McpServer.run()
+
+      {:error, reason} ->
+        App.error("Error initializing store: #{inspect(reason, pretty: true)}")
+        System.halt(1)
+    end
+
+  _ ->
+    App.help(1)
+end
