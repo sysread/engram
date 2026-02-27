@@ -236,10 +236,12 @@ defmodule RecallMemories do
 
   @impl true
   def call(%{"query" => query}) do
-    Store.search(query)
-    |> Enum.map(fn {_score, entry} -> entry end)
-    |> Enum.join("\n\n-----\n\n")
-    |> then(&{:ok, &1})
+    with {:ok, results} <- Store.search(query) do
+      results
+      |> Enum.map(fn {_score, entry} -> entry end)
+      |> Enum.join("\n\n-----\n\n")
+      |> then(&{:ok, &1})
+    end
   end
 end
 
@@ -248,22 +250,43 @@ end
 #-------------------------------------------------------------------------------
 defmodule App do
   def help(exit_code \\ 0) do
-    IO.puts("""
-    Usage: engram [options]
+    IO.puts(:standard_error, """
+    SYNOPSIS
+      engram <command> [options]
 
-    Options:
-      --help    | -h  Show this help message
-      --verbose | -v  Enable verbose output
-      --store <name>  Use the named store
+    DESCRIPTION
+      engram is a local storage system for LLMs to persist information across interactions.
 
-    Operations:
-      --create <name>         Create a new store
-      --list                  List existing stores
-      --remove <name>          Remove a store
-      --store <name> --reindex  Regenerate all embeddings
+    OPTIONS
+      --help    | -h      Show this help message
+      --verbose | -v      Enable verbose output
 
-    If no operation is specified, starts the MCP server using the stdio transport
-    with the specified store.
+    COMMANDS
+      list                List existing stores
+      create  <name>      Create a new store
+      remove  <name>      Remove a store
+      reindex <name>      Regenerate all embeddings
+      mcp     <name>      Start the MCP server with the named store (transport: stdio)
+
+    EXAMPLES
+      # Create a new store named "blarg"
+      engram create blarg
+
+      # Add blarg to claude
+      claude mcp add engram -- path/to/engram mcp blarg
+
+      # Add blarg to ~/.claude.json
+      "/Users/jeff.ober/dev/engram": {
+        "mcpServers": {
+          "engram": {
+            "type": "stdio",
+            "command": "path/to/engram",
+            "args": ["mcp", "blarg"],
+            "env": {}
+          }
+        },
+        ...
+      }
     """)
 
     System.halt(exit_code)
@@ -371,26 +394,33 @@ defmodule Store do
   def open(name) do
     path = db_path(name)
 
-    unless File.exists?(path) do
-      {:error, "Store '#{name}' does not exist. Use --create to create it."}
+    if store_exists?(name) do
+      with {:ok, db} <- Exqlite.Sqlite3.open(path) do
+        State.db(db)
+        :ok
+      else
+        {:error, reason} -> {:error, "Failed to open store '#{name}': #{inspect(reason)}"}
+      end
     else
-      {:ok, db} = Exqlite.Sqlite3.open(path)
-      State.db(db)
-      :ok
+      {:error, "Store '#{name}' does not exist. Use 'create' to create it."}
     end
   end
 
   def create(name) do
     init()
-    path = db_path(name)
 
-    if File.exists?(path) do
+    if store_exists?(name) do
       {:error, "Store '#{name}' already exists."}
     else
-      {:ok, db} = Exqlite.Sqlite3.open(path)
-      migrate(db)
-      Exqlite.Sqlite3.close(db)
-      {:ok, name}
+      path = db_path(name)
+
+      with {:ok, db} <- Exqlite.Sqlite3.open(path),
+           :ok <- migrate(db),
+           :ok <- Exqlite.Sqlite3.close(db) do
+        {:ok, name}
+      else
+        {:error, reason} -> {:error, "Failed to create store '#{name}': #{inspect(reason)}"}
+      end
     end
   end
 
@@ -416,18 +446,18 @@ defmodule Store do
   end
 
   #-----------------------------------------------------------------------------
-  # Schema -- single table for entries with content and cached embeddings.
-  # The model column tracks which embedding model generated the vector, so
-  # we can detect when a reindex is needed after a model change.
+  # Schema - single table for entries with content and cached embeddings. The
+  # model column tracks which embedding model generated the vector, so we can
+  # detect when a reindex is needed after a model change.
   #-----------------------------------------------------------------------------
   defp migrate(db) do
     :ok = Exqlite.Sqlite3.execute(db, """
       CREATE TABLE IF NOT EXISTS entries (
-        slug TEXT PRIMARY KEY,
-        label TEXT NOT NULL,
-        content TEXT NOT NULL,
-        embedding BLOB,
-        model TEXT
+          slug      TEXT PRIMARY KEY
+        , label     TEXT NOT NULL
+        , content   TEXT NOT NULL
+        , embedding BLOB
+        , model     TEXT
       )
     """)
   end
@@ -437,57 +467,90 @@ defmodule Store do
   #-----------------------------------------------------------------------------
   def list_entries() do
     db = State.db()
-
     {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT label FROM entries ORDER BY label")
     {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
     :ok = Exqlite.Sqlite3.release(db, stmt)
-
     rows |> Enum.map(fn [label] -> label end)
   end
 
   def write(label, data, opts \\ []) do
-    db = State.db()
-    overwrite = Keyword.get(opts, :overwrite, false)
     slug = slugify(label)
     content = "# #{label}\n\n#{data}"
+    overwrite = Keyword.get(opts, :overwrite, false)
 
-    # Check for existing entry
-    case entry_exists?(slug) do
-      true when not overwrite ->
-        {:error, "A memory with label '#{label}' already exists. " <>
-          "Read it first, then decide whether to overwrite, merge, or create a separate memory. " <>
-          "Pass overwrite: true to replace it."}
-
-      _ ->
-        {:ok, embedding} = Embeddings.embed(content)
-        blob = {:blob, :erlang.term_to_binary(embedding)}
-
-        {:ok, stmt} = Exqlite.Sqlite3.prepare(db, """
-          INSERT INTO entries (slug, label, content, embedding, model)
-          VALUES (?1, ?2, ?3, ?4, ?5)
-          ON CONFLICT(slug) DO UPDATE SET
-            label = excluded.label,
-            content = excluded.content,
-            embedding = excluded.embedding,
-            model = excluded.model
-        """)
-
-        :ok = Exqlite.Sqlite3.bind(stmt, [slug, label, content, blob, Embeddings.model()])
-        :done = Exqlite.Sqlite3.step(db, stmt)
-        :ok = Exqlite.Sqlite3.release(db, stmt)
-        :ok
+    with :ok <- check_overwrite(slug, label, overwrite),
+         {:ok, embedding} <- Embeddings.embed(content),
+         :ok <- upsert_entry(slug, label, content, embedding) do
+      :ok
+    else
+      {:error, reason} when is_binary(reason) -> {:error, reason}
+      {:error, reason} -> {:error, "Failed to write '#{label}': #{inspect(reason)}"}
     end
   end
 
   def read(slug) do
+    with {:ok, stmt} <- prepare_and_bind("SELECT content FROM entries WHERE slug = ?1", [slug]),
+         {:ok, content} <- fetch_one(stmt, slug) do
+      {:ok, content}
+    else
+      {:error, reason} when is_binary(reason) -> {:error, reason}
+      {:error, reason} -> {:error, "Failed to read '#{slug}': #{inspect(reason)}"}
+    end
+  end
+
+  def search(query, max_results \\ @max_results) do
+    with {:ok, query_embedding} <- Embeddings.embed(query),
+         {:ok, rows} <- fetch_all_embeddings() do
+      rows
+      |> Enum.map(fn [content, embedding_blob] ->
+        embedding = :erlang.binary_to_term(embedding_blob)
+        score = Embeddings.tensor_similarity(query_embedding, embedding)
+        {score, content}
+      end)
+      |> Enum.sort_by(&elem(&1, 0), :desc)
+      |> Enum.take(max_results)
+      |> then(&{:ok, &1})
+    else
+      {:error, reason} when is_binary(reason) -> {:error, reason}
+      {:error, reason} -> {:error, "Search failed: #{inspect(reason)}"}
+    end
+  end
+
+  #-----------------------------------------------------------------------------
+  # Helpers -- private functions that encapsulate SQLite operations. Public
+  # functions use `with` to compose these, reshaping errors into caller-
+  # friendly messages at the boundary.
+  #-----------------------------------------------------------------------------
+  defp store_exists?(name) do
+    name |> db_path() |> File.exists?()
+  end
+
+  defp check_overwrite(slug, label, overwrite) do
+    case {entry_exists?(slug), overwrite} do
+      {true, false} ->
+        {:error, "A memory with label '#{label}' already exists. " <>
+          "Read it first, then decide whether to overwrite, merge, or create a separate memory. " <>
+          "Pass overwrite: true to replace it."}
+      _ ->
+        :ok
+    end
+  end
+
+  defp prepare_and_bind(sql, params) do
     db = State.db()
 
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT content FROM entries WHERE slug = ?1")
-    :ok = Exqlite.Sqlite3.bind(stmt, [slug])
+    with {:ok, stmt} <- Exqlite.Sqlite3.prepare(db, sql),
+         :ok <- Exqlite.Sqlite3.bind(stmt, params) do
+      {:ok, stmt}
+    end
+  end
+
+  defp fetch_one(stmt, slug) do
+    db = State.db()
 
     result =
       case Exqlite.Sqlite3.step(db, stmt) do
-        {:row, [content]} -> {:ok, content}
+        {:row, [value]} -> {:ok, value}
         :done -> {:error, "Entry '#{slug}' not found."}
       end
 
@@ -495,30 +558,6 @@ defmodule Store do
     result
   end
 
-  def search(query, max_results \\ @max_results) do
-    db = State.db()
-    {:ok, query_embedding} = Embeddings.embed(query)
-
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db,
-      "SELECT content, embedding FROM entries WHERE embedding IS NOT NULL"
-    )
-
-    {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
-    :ok = Exqlite.Sqlite3.release(db, stmt)
-
-    rows
-    |> Enum.map(fn [content, embedding_blob] ->
-      embedding = :erlang.binary_to_term(embedding_blob)
-      score = Embeddings.tensor_similarity(query_embedding, embedding)
-      {score, content}
-    end)
-    |> Enum.sort_by(&elem(&1, 0), :desc)
-    |> Enum.take(max_results)
-  end
-
-  #-----------------------------------------------------------------------------
-  # Helpers
-  #-----------------------------------------------------------------------------
   defp entry_exists?(slug) do
     db = State.db()
 
@@ -530,15 +569,52 @@ defmodule Store do
     match?({:row, _}, result)
   end
 
-  def reindex() do
+  defp upsert_entry(slug, label, content, embedding) do
     db = State.db()
-    model = Embeddings.model()
+    blob = {:blob, :erlang.term_to_binary(embedding)}
+
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, """
+      INSERT INTO entries (slug, label, content, embedding, model)
+      VALUES (?1, ?2, ?3, ?4, ?5)
+      ON CONFLICT(slug) DO UPDATE SET
+        label = excluded.label,
+        content = excluded.content,
+        embedding = excluded.embedding,
+        model = excluded.model
+    """)
+
+    :ok = Exqlite.Sqlite3.bind(stmt, [slug, label, content, blob, Embeddings.model()])
+    :done = Exqlite.Sqlite3.step(db, stmt)
+    :ok = Exqlite.Sqlite3.release(db, stmt)
+    :ok
+  end
+
+  defp fetch_all_embeddings() do
+    db = State.db()
+
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db,
+      "SELECT content, embedding FROM entries WHERE embedding IS NOT NULL"
+    )
+
+    {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
+    :ok = Exqlite.Sqlite3.release(db, stmt)
+    {:ok, rows}
+  end
+
+  defp fetch_all_content() do
+    db = State.db()
 
     {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT slug, content FROM entries")
     {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
     :ok = Exqlite.Sqlite3.release(db, stmt)
+    {:ok, rows}
+  end
 
-    {:ok, update_stmt} = Exqlite.Sqlite3.prepare(db,
+  defp reindex_entries(rows) do
+    db = State.db()
+    model = Embeddings.model()
+
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db,
       "UPDATE entries SET embedding = ?1, model = ?2 WHERE slug = ?3"
     )
 
@@ -546,12 +622,23 @@ defmodule Store do
       App.info("Reindexing '#{slug}'...")
       {:ok, embedding} = Embeddings.embed(content)
       blob = {:blob, :erlang.term_to_binary(embedding)}
-      :ok = Exqlite.Sqlite3.bind(update_stmt, [blob, model, slug])
-      :done = Exqlite.Sqlite3.step(db, update_stmt)
+      :ok = Exqlite.Sqlite3.bind(stmt, [blob, model, slug])
+      :done = Exqlite.Sqlite3.step(db, stmt)
     end)
 
-    :ok = Exqlite.Sqlite3.release(db, update_stmt)
-    App.info("Reindex complete. #{length(rows)} entries updated.")
+    :ok = Exqlite.Sqlite3.release(db, stmt)
+    :ok
+  end
+
+  def reindex() do
+    with {:ok, rows} <- fetch_all_content(),
+         :ok <- reindex_entries(rows) do
+      App.info("Reindex complete. #{length(rows)} entries updated.")
+      :ok
+    else
+      {:error, reason} when is_binary(reason) -> {:error, reason}
+      {:error, reason} -> {:error, "Reindex failed: #{inspect(reason)}"}
+    end
   end
 
   defp slugify(label) do
@@ -566,28 +653,30 @@ end
 #-------------------------------------------------------------------------------
 # Process ARGV
 #-------------------------------------------------------------------------------
-args =
+{flags, argv, invalid} =
   System.argv()
   |> OptionParser.parse(
     switches: [
       help: :boolean,
       verbose: :boolean,
-      create: :string,
-      list: :boolean,
-      remove: :string,
-      reindex: :boolean,
-      store: :string,
     ],
     aliases: [
       h: :help,
       v: :verbose,
     ]
   )
-  |> then(fn {args, _, _} -> args end)
-  |> Map.new()
+
+# Reject unrecognized flags
+if invalid != [] do
+  bad = Enum.map(invalid, fn {k, _} -> k end)
+  App.error("Unrecognized flags: #{Enum.join(bad, ", ")}")
+  App.help(1)
+end
+
+flags = Map.new(flags)
 
 # Override logger level if --verbose is set
-if args[:verbose] do
+if flags[:verbose] do
   :logger.set_primary_config(:level, :debug)
 end
 
@@ -596,45 +685,71 @@ State.start_link()
 #-------------------------------------------------------------------------------
 # Dispatch
 #-------------------------------------------------------------------------------
-case args do
-  %{help: true} ->
+case argv do
+  _ when flags[:help] == true ->
     App.help(0)
 
-  %{create: name} ->
-    case Store.create(name) do
-      {:ok, name} -> App.info("Created store '#{name}'")
-      {:error, reason} -> App.error(reason)
-    end
-
-  %{list: true} ->
+  ["list"] ->
     case Store.list_stores() do
       {:ok, []} ->
-        IO.puts("No stores found. Use --create <name> to create one.")
+        IO.puts("No stores found. Use 'create <name>' to create one.")
 
       {:ok, stores} ->
         IO.puts("Existing stores:")
         stores |> Enum.each(&IO.puts("  - #{&1}"))
     end
 
-  %{remove: name} ->
+  ["create", name] ->
+    case Store.create(name) do
+      {:ok, name} ->
+        IO.puts(:standard_error, """
+        Created store '#{name}'.
+
+        To start the MCP server:
+          ./engram mcp #{name}
+
+        To add to Claude Code:
+          claude mcp add engram -- ./engram mcp #{name}
+
+        Or add directly to ~/.claude.json:
+          "<project-root>": {
+            "mcpServers": {
+              "engram": {
+                "type": "stdio",
+                "command": "./engram",
+                "args": ["mcp", "#{name}"],
+                "env": {}
+              }
+            }
+          }
+        """)
+
+      {:error, reason} ->
+        App.error(reason)
+    end
+
+  ["remove", name] ->
     case Store.remove_store(name) do
       :ok -> App.info("Removed store '#{name}'")
       {:error, reason} -> App.error(reason)
     end
 
-  %{store: name, reindex: true} ->
-    case Store.open(name) do
-      :ok ->
-        Nx.global_default_backend(EXLA.Backend)
-        Embeddings.start()
-        Store.reindex()
+  ["reindex", name] ->
+    with :ok <- Store.open(name) do
+      Nx.global_default_backend(EXLA.Backend)
+      Embeddings.start()
 
+      case Store.reindex() do
+        :ok -> :ok
+        {:error, reason} -> App.error(reason)
+      end
+    else
       {:error, reason} ->
         App.error(reason)
         System.halt(1)
     end
 
-  %{store: name} ->
+  ["mcp", name] ->
     case Store.open(name) do
       :ok ->
         App.info("Using store '#{name}'")
