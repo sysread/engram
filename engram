@@ -691,10 +691,11 @@ State.start_link()
 #-------------------------------------------------------------------------------
 # Dispatch
 #-------------------------------------------------------------------------------
-case argv do
-  _ when flags[:help] == true ->
-    App.help(0)
+if flags[:help] do
+  App.help(0)
+end
 
+case argv do
   ["list"] ->
     case Store.list_stores() do
       {:ok, []} ->
