@@ -109,9 +109,15 @@ defmodule McpServer do
       tool ->
         args = Map.get(params, "arguments", %{})
 
-        case tool.call(args) do
-          {:ok, text} -> {:ok, %{content: [%{type: "text", text: text}]}}
-          {:error, reason} -> {:tool_error, reason}
+        try do
+          case tool.call(args) do
+            {:ok, text} -> {:ok, %{content: [%{type: "text", text: text}]}}
+            {:error, reason} -> {:tool_error, reason}
+          end
+        rescue
+          e ->
+            App.error("Tool '#{name}' crashed", e)
+            {:tool_error, "Internal error: #{Exception.message(e)}"}
         end
     end
   end
@@ -729,9 +735,21 @@ case argv do
     end
 
   ["remove", name] ->
-    case Store.remove_store(name) do
-      :ok -> App.info("Removed store '#{name}'")
-      {:error, reason} -> App.error(reason)
+    IO.write(:standard_error, "Remove store '#{name}'? This cannot be undone. [y/N] ")
+
+    case IO.read(:stdio, :line) do
+      line when is_binary(line) ->
+        if String.trim(line) |> String.downcase() == "y" do
+          case Store.remove_store(name) do
+            :ok -> App.info("Removed store '#{name}'")
+            {:error, reason} -> App.error(reason)
+          end
+        else
+          App.info("Cancelled.")
+        end
+
+      _ ->
+        App.info("Cancelled.")
     end
 
   ["reindex", name] ->
