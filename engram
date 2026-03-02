@@ -251,6 +251,47 @@ defmodule RecallMemories do
   end
 end
 
+defmodule FindDuplicateMemories do
+  @behaviour McpTool
+
+  @impl true
+  def spec() do
+    %{
+      name: "find_duplicates",
+      description: "Finds memories with unusually similar content that may be candidates for consolidation. " <>
+        "Uses statistical outlier detection rather than a fixed threshold, so it adapts to the embedding model's score range.",
+      inputSchema: %{
+        type: "object",
+        properties: %{
+          sensitivity: %{
+            type: "number",
+            description: "How many standard deviations above mean to flag (default 1.5). " <>
+              "Lower values find more pairs, higher values are stricter."
+          }
+        }
+      }
+    }
+  end
+
+  @impl true
+  def call(args) do
+    sensitivity = Map.get(args, "sensitivity", 1.5)
+
+    with {:ok, pairs} <- Store.find_duplicates(sensitivity) do
+      if pairs == [] do
+        {:ok, "No unusually similar memories found."}
+      else
+        pairs
+        |> Enum.map(fn {score, label_a, label_b} ->
+          "#{Float.round(score, 3)} | \"#{label_a}\" <-> \"#{label_b}\""
+        end)
+        |> Enum.join("\n")
+        |> then(&{:ok, "Potentially duplicate memories (score | pair):\n#{&1}"})
+      end
+    end
+  end
+end
+
 #-------------------------------------------------------------------------------
 # Common app bits
 #-------------------------------------------------------------------------------
@@ -269,10 +310,11 @@ defmodule App do
 
     COMMANDS
       list                List existing stores
-      create  <name>      Create a new store
-      remove  <name>      Remove a store
-      reindex <name>      Regenerate all embeddings
-      mcp     <name>      Start the MCP server with the named store (transport: stdio)
+      create      <name>  Create a new store
+      remove      <name>  Remove a store
+      reindex     <name>  Regenerate all embeddings
+      duplicates  <name>  Find memories with similar content
+      mcp         <name>  Start the MCP server with the named store (transport: stdio)
 
     EXAMPLES
       # Create a new store named "blarg"
@@ -607,6 +649,24 @@ defmodule Store do
     {:ok, rows}
   end
 
+  defp fetch_all_labeled_embeddings() do
+    db = State.db()
+
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db,
+      "SELECT slug, label, embedding FROM entries WHERE embedding IS NOT NULL"
+    )
+
+    {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
+    :ok = Exqlite.Sqlite3.release(db, stmt)
+
+    entries =
+      Enum.map(rows, fn [slug, label, blob] ->
+        %{slug: slug, label: label, embedding: :erlang.binary_to_term(blob)}
+      end)
+
+    {:ok, entries}
+  end
+
   defp fetch_all_content() do
     db = State.db()
 
@@ -634,6 +694,74 @@ defmodule Store do
 
     :ok = Exqlite.Sqlite3.release(db, stmt)
     :ok
+  end
+
+  # Finds entries whose embeddings are unusually similar to each other,
+  # suggesting they may be duplicates or candidates for consolidation.
+  #
+  # Rather than using a fixed similarity threshold (which would be
+  # model-dependent), we compute all pairwise similarity scores, then
+  # use z-score outlier detection: pairs scoring more than `sensitivity`
+  # standard deviations above the mean are flagged. This adapts to the
+  # actual score distribution regardless of model quality.
+  #
+  # sensitivity=1.5 catches the upper ~7% of pairs (moderate).
+  # sensitivity=1.0 is more aggressive (~16%), 2.0 is stricter (~2%).
+  def find_duplicates(sensitivity \\ 1.5) do
+    with {:ok, entries} <- fetch_all_labeled_embeddings() do
+      pairs =
+        for a <- entries, b <- entries, a.slug < b.slug do
+          {a, b}
+        end
+
+      if pairs == [] do
+        {:ok, []}
+      else
+        # Compute all pairwise similarity scores in parallel
+        scored =
+          pairs
+          |> Task.async_stream(
+            fn {a, b} ->
+              score = Embeddings.tensor_similarity(a.embedding, b.embedding)
+              {score, a.label, b.label}
+            end,
+            max_concurrency: System.schedulers_online(),
+            ordered: false
+          )
+          |> Enum.map(fn {:ok, result} -> result end)
+
+        # Compute mean and stddev of score distribution
+        scores = Enum.map(scored, &elem(&1, 0))
+        {mean, stddev} = mean_and_stddev(scores)
+        threshold = mean + sensitivity * stddev
+
+        App.debug("Duplicate detection: mean=#{Float.round(mean, 4)}, " <>
+          "stddev=#{Float.round(stddev, 4)}, threshold=#{Float.round(threshold, 4)}")
+
+        results =
+          scored
+          |> Enum.filter(fn {score, _, _} -> score >= threshold end)
+          |> Enum.sort_by(&elem(&1, 0), :desc)
+
+        {:ok, results}
+      end
+    else
+      {:error, reason} when is_binary(reason) -> {:error, reason}
+      {:error, reason} -> {:error, "Duplicate search failed: #{inspect(reason)}"}
+    end
+  end
+
+  defp mean_and_stddev(values) do
+    n = length(values)
+    mean = Enum.sum(values) / n
+
+    variance =
+      values
+      |> Enum.map(fn v -> (v - mean) * (v - mean) end)
+      |> Enum.sum()
+      |> Kernel./(n)
+
+    {mean, :math.sqrt(variance)}
   end
 
   def reindex() do
@@ -751,6 +879,30 @@ case argv do
 
       _ ->
         App.info("Cancelled.")
+    end
+
+  ["duplicates", name] ->
+    with :ok <- Store.open(name) do
+      Nx.global_default_backend(EXLA.Backend)
+      Embeddings.start()
+
+      case Store.find_duplicates() do
+        {:ok, []} ->
+          IO.puts("No unusually similar memories found.")
+
+        {:ok, pairs} ->
+          IO.puts("Potentially duplicate memories:")
+          Enum.each(pairs, fn {score, label_a, label_b} ->
+            IO.puts("  #{Float.round(score, 3)} | \"#{label_a}\" <-> \"#{label_b}\"")
+          end)
+
+        {:error, reason} ->
+          App.error(reason)
+      end
+    else
+      {:error, reason} ->
+        App.error(reason)
+        System.halt(1)
     end
 
   ["reindex", name] ->
