@@ -179,6 +179,10 @@ defmodule StoreMemories do
           overwrite: %{
             type: "boolean",
             description: "Set to true to overwrite an existing memory with the same label"
+          },
+          store: %{
+            type: "string",
+            description: "Which store to write to (defaults to the primary project store)"
           }
         }
       }
@@ -187,10 +191,11 @@ defmodule StoreMemories do
 
   @impl true
   def call(%{"label" => label, "data" => data} = args) do
+    store = Map.get(args, "store", State.default_store())
     overwrite = Map.get(args, "overwrite", false)
 
-    case Store.write(label, data, overwrite: overwrite) do
-      :ok -> {:ok, "'#{label}' has been remembered"}
+    case Store.write(store, label, data, overwrite: overwrite) do
+      :ok -> {:ok, "'#{label}' has been remembered in store '#{store}'"}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -206,14 +211,22 @@ defmodule ListMemories do
       description: "Lists all entries in the current store",
       inputSchema: %{
         type: "object",
-        properties: %{}
+        properties: %{
+          store: %{
+            type: "string",
+            description: "Which store to list (defaults to the primary project store)"
+          }
+        }
       }
     }
   end
 
   @impl true
-  def call(_) do
-    Store.list_entries()
+  def call(args) do
+    store = Map.get(args, "store", State.default_store())
+
+    Store.list_entries(store)
+    |> Enum.map(&"[#{store}] #{&1}")
     |> Enum.join("\n")
     |> then(&{:ok, &1})
   end
@@ -226,7 +239,7 @@ defmodule RecallMemories do
   def spec() do
     %{
       name: "recall",
-      description: "Recalls information from the current store relevant to a query",
+      description: "Recalls information from all active stores relevant to a query",
       inputSchema: %{
         type: "object",
         required: ["query"],
@@ -263,6 +276,10 @@ defmodule FindDuplicateMemories do
       inputSchema: %{
         type: "object",
         properties: %{
+          store: %{
+            type: "string",
+            description: "Which store to check (defaults to the primary project store)"
+          },
           sensitivity: %{
             type: "number",
             description: "How many standard deviations above mean to flag (default 1.5). " <>
@@ -275,19 +292,81 @@ defmodule FindDuplicateMemories do
 
   @impl true
   def call(args) do
+    store = Map.get(args, "store", State.default_store())
     sensitivity = Map.get(args, "sensitivity", 1.5)
 
-    with {:ok, pairs} <- Store.find_duplicates(sensitivity) do
+    with {:ok, pairs} <- Store.find_duplicates(store, sensitivity) do
       if pairs == [] do
-        {:ok, "No unusually similar memories found."}
+        {:ok, "No unusually similar memories found in store '#{store}'."}
       else
         pairs
         |> Enum.map(fn {score, label_a, label_b} ->
           "#{Float.round(score, 3)} | \"#{label_a}\" <-> \"#{label_b}\""
         end)
         |> Enum.join("\n")
-        |> then(&{:ok, "Potentially duplicate memories (score | pair):\n#{&1}"})
+        |> then(&{:ok, "Potentially duplicate memories in '#{store}' (score | pair):\n#{&1}"})
       end
+    end
+  end
+end
+
+defmodule ListStores do
+  @behaviour McpTool
+
+  @impl true
+  def spec() do
+    %{
+      name: "list_stores",
+      description: "Lists the stores available in this session",
+      inputSchema: %{
+        type: "object",
+        properties: %{}
+      }
+    }
+  end
+
+  @impl true
+  def call(_args) do
+    stores = State.stores()
+
+    stores
+    |> Enum.join("\n")
+    |> then(&{:ok, &1})
+  end
+end
+
+defmodule ForgetMemory do
+  @behaviour McpTool
+
+  @impl true
+  def spec() do
+    %{
+      name: "forget",
+      description: "Removes a memory by label from a store",
+      inputSchema: %{
+        type: "object",
+        required: ["label"],
+        properties: %{
+          label: %{
+            type: "string",
+            description: "The label of the memory to remove"
+          },
+          store: %{
+            type: "string",
+            description: "Which store to remove from (defaults to the primary project store)"
+          }
+        }
+      }
+    }
+  end
+
+  @impl true
+  def call(%{"label" => label} = args) do
+    store = Map.get(args, "store", State.default_store())
+
+    case Store.forget(store, label) do
+      :ok -> {:ok, "'#{label}' has been forgotten from store '#{store}'."}
+      {:error, reason} -> {:error, reason}
     end
   end
 end
@@ -309,32 +388,34 @@ defmodule App do
       --verbose | -v      Enable verbose output
 
     COMMANDS
-      list                List existing stores
-      create      <name>  Create a new store
-      remove      <name>  Remove a store
-      reindex     <name>  Regenerate all embeddings
-      duplicates  <name>  Find memories with similar content
-      mcp         <name>  Start the MCP server with the named store (transport: stdio)
+      list                     List existing stores
+      create      <name>       Create a new store
+      remove      <name>       Remove a store
+      reindex     <name>       Regenerate all embeddings
+      duplicates  <name>       Find memories with similar content
+      mcp         <name> ...   Start the MCP server with one or more stores (transport: stdio)
 
     EXAMPLES
-      # Create a new store named "blarg"
-      engram create blarg
+      # Create stores for a project
+      engram create myproject
+      engram create global
 
-      # Add blarg to claude
-      claude mcp add engram -- path/to/engram mcp blarg
+      # Start MCP server with project + global stores
+      engram mcp myproject global
 
-      # Add blarg to ~/.claude.json
-      "/Users/jeff.ober/dev/engram": {
+      # Add to .mcp.json (recommended for worktree sharing)
+      {
         "mcpServers": {
           "engram": {
             "type": "stdio",
             "command": "path/to/engram",
-            "args": ["mcp", "blarg"],
-            "env": {}
+            "args": ["mcp", "myproject", "global"]
           }
-        },
-        ...
+        }
       }
+
+      # Or via claude CLI
+      claude mcp add engram --scope project -- path/to/engram mcp myproject global
     """)
 
     System.halt(exit_code)
@@ -419,74 +500,88 @@ end
 defmodule State do
   use Agent
 
-  def start_link(), do: Agent.start_link(fn -> %{} end, name: __MODULE__)
+  def start_link(), do: Agent.start_link(fn -> %{db: nil, stores: []} end, name: __MODULE__)
 
   def db(ref), do: Agent.update(__MODULE__, &Map.put(&1, :db, ref))
   def db(), do: Agent.get(__MODULE__, &Map.get(&1, :db))
+
+  # The list of store names this instance is serving (set at startup)
+  def stores(names), do: Agent.update(__MODULE__, &Map.put(&1, :stores, names))
+  def stores(), do: Agent.get(__MODULE__, &Map.get(&1, :stores))
+
+  # The default store is the first one listed (the "primary" project store)
+  def default_store(), do: stores() |> List.first()
 end
 
 defmodule Store do
   @max_results 10
 
   #-----------------------------------------------------------------------------
-  # Store management -- each store is a SQLite database file under
-  # ~/.config/engram/<name>.db. The schema is created on first open.
+  # Database management -- all stores live in a single SQLite database at
+  # ~/.config/engram/engram.db. Each store is a named partition; entries are
+  # scoped by a (slug, store) composite key. WAL mode enables concurrent
+  # readers across multiple engram processes sharing the same db file.
   #-----------------------------------------------------------------------------
   def base_path(), do: [System.user_home!(), ".config", "engram"] |> Path.join()
-  defp db_path(name), do: Path.join(base_path(), name <> ".db")
+  defp db_path(), do: Path.join(base_path(), "engram.db")
 
   def init() do
     File.mkdir_p!(base_path())
   end
 
-  def open(name) do
-    path = db_path(name)
+  # Opens the shared database, sets WAL mode for safe multi-process access,
+  # and runs migrations. Called once at startup.
+  def open_db() do
+    init()
 
-    if store_exists?(name) do
-      with {:ok, db} <- Exqlite.Sqlite3.open(path) do
-        State.db(db)
-        :ok
-      else
-        {:error, reason} -> {:error, "Failed to open store '#{name}': #{inspect(reason)}"}
-      end
+    with {:ok, db} <- Exqlite.Sqlite3.open(db_path()),
+         :ok <- Exqlite.Sqlite3.execute(db, "PRAGMA journal_mode=WAL"),
+         :ok <- Exqlite.Sqlite3.execute(db, "PRAGMA busy_timeout=5000"),
+         :ok <- migrate(db) do
+      State.db(db)
+      :ok
     else
-      {:error, "Store '#{name}' does not exist. Use 'create' to create it."}
+      {:error, reason} -> {:error, "Failed to open database: #{inspect(reason)}"}
+    end
+  end
+
+  # Validates that all requested stores exist in the database. Returns :ok
+  # if all exist, or an error naming the missing ones.
+  def validate_stores(names) do
+    missing = Enum.reject(names, &store_exists?/1)
+
+    if missing == [] do
+      :ok
+    else
+      {:error, "Store(s) not found: #{Enum.join(missing, ", ")}. Use 'create' to create them."}
     end
   end
 
   def create(name) do
-    init()
-
-    if store_exists?(name) do
-      {:error, "Store '#{name}' already exists."}
-    else
-      path = db_path(name)
-
-      with {:ok, db} <- Exqlite.Sqlite3.open(path),
-           :ok <- migrate(db),
-           :ok <- Exqlite.Sqlite3.close(db) do
-        {:ok, name}
+    with :ok <- open_db() do
+      if store_exists?(name) do
+        {:error, "Store '#{name}' already exists."}
       else
-        {:error, reason} -> {:error, "Failed to create store '#{name}': #{inspect(reason)}"}
+        exec("INSERT INTO stores (name) VALUES (?1)", [name])
+        {:ok, name}
       end
     end
   end
 
   def list_stores() do
-    init()
-
-    base_path()
-    |> File.ls!()
-    |> Enum.filter(&String.ends_with?(&1, ".db"))
-    |> Enum.map(&String.replace_suffix(&1, ".db", ""))
-    |> then(&{:ok, &1})
+    with :ok <- open_db() do
+      db = State.db()
+      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT name FROM stores ORDER BY name")
+      {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
+      :ok = Exqlite.Sqlite3.release(db, stmt)
+      {:ok, Enum.map(rows, fn [name] -> name end)}
+    end
   end
 
   def remove_store(name) do
-    path = db_path(name)
-
-    if File.exists?(path) do
-      File.rm!(path)
+    if store_exists?(name) do
+      exec("DELETE FROM entries WHERE store = ?1", [name])
+      exec("DELETE FROM stores WHERE name = ?1", [name])
       :ok
     else
       {:error, "Store '#{name}' does not exist."}
@@ -494,41 +589,52 @@ defmodule Store do
   end
 
   #-----------------------------------------------------------------------------
-  # Schema - single table for entries with content and cached embeddings. The
-  # model column tracks which embedding model generated the vector, so we can
-  # detect when a reindex is needed after a model change.
+  # Schema -- stores table tracks named partitions. Entries table holds content
+  # and cached embeddings, scoped by store via composite primary key. The model
+  # column tracks which embedding model generated the vector so we can detect
+  # when a reindex is needed after a model change.
   #-----------------------------------------------------------------------------
   defp migrate(db) do
     :ok = Exqlite.Sqlite3.execute(db, """
+      CREATE TABLE IF NOT EXISTS stores (
+        name TEXT PRIMARY KEY
+      )
+    """)
+
+    :ok = Exqlite.Sqlite3.execute(db, """
       CREATE TABLE IF NOT EXISTS entries (
-          slug      TEXT PRIMARY KEY
+          slug      TEXT NOT NULL
+        , store     TEXT NOT NULL REFERENCES stores(name)
         , label     TEXT NOT NULL
         , content   TEXT NOT NULL
         , embedding BLOB
         , model     TEXT
+        , PRIMARY KEY (slug, store)
       )
     """)
   end
 
   #-----------------------------------------------------------------------------
-  # Entry operations
+  # Entry operations -- all scoped by store name. When called from MCP tools,
+  # the store defaults to State.default_store() if not specified.
   #-----------------------------------------------------------------------------
-  def list_entries() do
+  def list_entries(store) do
     db = State.db()
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT label FROM entries ORDER BY label")
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT label FROM entries WHERE store = ?1 ORDER BY label")
+    :ok = Exqlite.Sqlite3.bind(stmt, [store])
     {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
     :ok = Exqlite.Sqlite3.release(db, stmt)
     rows |> Enum.map(fn [label] -> label end)
   end
 
-  def write(label, data, opts \\ []) do
+  def write(store, label, data, opts \\ []) do
     slug = slugify(label)
     content = "# #{label}\n\n#{data}"
     overwrite = Keyword.get(opts, :overwrite, false)
 
-    with :ok <- check_overwrite(slug, label, overwrite),
+    with :ok <- check_overwrite(store, slug, label, overwrite),
          {:ok, embedding} <- Embeddings.embed(content),
-         :ok <- upsert_entry(slug, label, content, embedding) do
+         :ok <- upsert_entry(store, slug, label, content, embedding) do
       :ok
     else
       {:error, reason} when is_binary(reason) -> {:error, reason}
@@ -536,8 +642,9 @@ defmodule Store do
     end
   end
 
-  def read(slug) do
-    with {:ok, stmt} <- prepare_and_bind("SELECT content FROM entries WHERE slug = ?1", [slug]),
+  def read(store, slug) do
+    with {:ok, stmt} <- prepare_and_bind(
+           "SELECT content FROM entries WHERE slug = ?1 AND store = ?2", [slug, store]),
          {:ok, content} <- fetch_one(stmt, slug) do
       {:ok, content}
     else
@@ -546,9 +653,13 @@ defmodule Store do
     end
   end
 
+  # Searches across all active stores (as listed in State.stores()). Results
+  # from all stores are merged and ranked by similarity score.
   def search(query, max_results \\ @max_results) do
+    stores = State.stores()
+
     with {:ok, query_embedding} <- Embeddings.embed(query),
-         {:ok, rows} <- fetch_all_embeddings() do
+         {:ok, rows} <- fetch_all_embeddings(stores) do
       rows
       |> Enum.map(fn [content, embedding_blob] ->
         embedding = :erlang.binary_to_term(embedding_blob)
@@ -570,11 +681,16 @@ defmodule Store do
   # friendly messages at the boundary.
   #-----------------------------------------------------------------------------
   defp store_exists?(name) do
-    name |> db_path() |> File.exists?()
+    db = State.db()
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT 1 FROM stores WHERE name = ?1")
+    :ok = Exqlite.Sqlite3.bind(stmt, [name])
+    result = Exqlite.Sqlite3.step(db, stmt)
+    :ok = Exqlite.Sqlite3.release(db, stmt)
+    match?({:row, _}, result)
   end
 
-  defp check_overwrite(slug, label, overwrite) do
-    case {entry_exists?(slug), overwrite} do
+  defp check_overwrite(store, slug, label, overwrite) do
+    case {entry_exists?(store, slug), overwrite} do
       {true, false} ->
         {:error, "A memory with label '#{label}' already exists. " <>
           "Read it first, then decide whether to overwrite, merge, or create a separate memory. " <>
@@ -606,56 +722,72 @@ defmodule Store do
     result
   end
 
-  defp entry_exists?(slug) do
+  defp entry_exists?(store, slug) do
     db = State.db()
 
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT 1 FROM entries WHERE slug = ?1")
-    :ok = Exqlite.Sqlite3.bind(stmt, [slug])
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT 1 FROM entries WHERE slug = ?1 AND store = ?2")
+    :ok = Exqlite.Sqlite3.bind(stmt, [slug, store])
     result = Exqlite.Sqlite3.step(db, stmt)
     :ok = Exqlite.Sqlite3.release(db, stmt)
 
     match?({:row, _}, result)
   end
 
-  defp upsert_entry(slug, label, content, embedding) do
+  defp upsert_entry(store, slug, label, content, embedding) do
     db = State.db()
     blob = {:blob, :erlang.term_to_binary(embedding)}
 
     {:ok, stmt} = Exqlite.Sqlite3.prepare(db, """
-      INSERT INTO entries (slug, label, content, embedding, model)
-      VALUES (?1, ?2, ?3, ?4, ?5)
-      ON CONFLICT(slug) DO UPDATE SET
+      INSERT INTO entries (slug, store, label, content, embedding, model)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      ON CONFLICT(slug, store) DO UPDATE SET
         label = excluded.label,
         content = excluded.content,
         embedding = excluded.embedding,
         model = excluded.model
     """)
 
-    :ok = Exqlite.Sqlite3.bind(stmt, [slug, label, content, blob, Embeddings.model()])
+    :ok = Exqlite.Sqlite3.bind(stmt, [slug, store, label, content, blob, Embeddings.model()])
     :done = Exqlite.Sqlite3.step(db, stmt)
     :ok = Exqlite.Sqlite3.release(db, stmt)
     :ok
   end
 
-  defp fetch_all_embeddings() do
+  # Removes a single entry by label from the given store.
+  def forget(store, label) do
+    slug = slugify(label)
+
+    if entry_exists?(store, slug) do
+      exec("DELETE FROM entries WHERE slug = ?1 AND store = ?2", [slug, store])
+      :ok
+    else
+      {:error, "No memory with label '#{label}' found in store '#{store}'."}
+    end
+  end
+
+  # Fetches embeddings across multiple stores for cross-store search
+  defp fetch_all_embeddings(stores) do
     db = State.db()
+    placeholders = stores |> Enum.with_index(1) |> Enum.map(fn {_, i} -> "?#{i}" end) |> Enum.join(", ")
 
     {:ok, stmt} = Exqlite.Sqlite3.prepare(db,
-      "SELECT content, embedding FROM entries WHERE embedding IS NOT NULL"
+      "SELECT content, embedding FROM entries WHERE embedding IS NOT NULL AND store IN (#{placeholders})"
     )
 
+    :ok = Exqlite.Sqlite3.bind(stmt, stores)
     {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
     :ok = Exqlite.Sqlite3.release(db, stmt)
     {:ok, rows}
   end
 
-  defp fetch_all_labeled_embeddings() do
+  defp fetch_all_labeled_embeddings(store) do
     db = State.db()
 
     {:ok, stmt} = Exqlite.Sqlite3.prepare(db,
-      "SELECT slug, label, embedding FROM entries WHERE embedding IS NOT NULL"
+      "SELECT slug, label, embedding FROM entries WHERE embedding IS NOT NULL AND store = ?1"
     )
 
+    :ok = Exqlite.Sqlite3.bind(stmt, [store])
     {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
     :ok = Exqlite.Sqlite3.release(db, stmt)
 
@@ -667,31 +799,42 @@ defmodule Store do
     {:ok, entries}
   end
 
-  defp fetch_all_content() do
+  defp fetch_all_content(store) do
     db = State.db()
 
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT slug, content FROM entries")
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT slug, content FROM entries WHERE store = ?1")
+    :ok = Exqlite.Sqlite3.bind(stmt, [store])
     {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
     :ok = Exqlite.Sqlite3.release(db, stmt)
     {:ok, rows}
   end
 
-  defp reindex_entries(rows) do
+  defp reindex_entries(store, rows) do
     db = State.db()
     model = Embeddings.model()
 
     {:ok, stmt} = Exqlite.Sqlite3.prepare(db,
-      "UPDATE entries SET embedding = ?1, model = ?2 WHERE slug = ?3"
+      "UPDATE entries SET embedding = ?1, model = ?2 WHERE slug = ?3 AND store = ?4"
     )
 
     Enum.each(rows, fn [slug, content] ->
       App.info("Reindexing '#{slug}'...")
       {:ok, embedding} = Embeddings.embed(content)
       blob = {:blob, :erlang.term_to_binary(embedding)}
-      :ok = Exqlite.Sqlite3.bind(stmt, [blob, model, slug])
+      :ok = Exqlite.Sqlite3.bind(stmt, [blob, model, slug, store])
       :done = Exqlite.Sqlite3.step(db, stmt)
     end)
 
+    :ok = Exqlite.Sqlite3.release(db, stmt)
+    :ok
+  end
+
+  # Executes a write statement (INSERT/UPDATE/DELETE) with bound params
+  defp exec(sql, params) do
+    db = State.db()
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
+    :ok = Exqlite.Sqlite3.bind(stmt, params)
+    :done = Exqlite.Sqlite3.step(db, stmt)
     :ok = Exqlite.Sqlite3.release(db, stmt)
     :ok
   end
@@ -707,8 +850,8 @@ defmodule Store do
   #
   # sensitivity=1.5 catches the upper ~7% of pairs (moderate).
   # sensitivity=1.0 is more aggressive (~16%), 2.0 is stricter (~2%).
-  def find_duplicates(sensitivity \\ 1.5) do
-    with {:ok, entries} <- fetch_all_labeled_embeddings() do
+  def find_duplicates(store, sensitivity \\ 1.5) do
+    with {:ok, entries} <- fetch_all_labeled_embeddings(store) do
       pairs =
         for a <- entries, b <- entries, a.slug < b.slug do
           {a, b}
@@ -764,9 +907,9 @@ defmodule Store do
     {mean, :math.sqrt(variance)}
   end
 
-  def reindex() do
-    with {:ok, rows} <- fetch_all_content(),
-         :ok <- reindex_entries(rows) do
+  def reindex(store) do
+    with {:ok, rows} <- fetch_all_content(store),
+         :ok <- reindex_entries(store, rows) do
       App.info("Reindex complete. #{length(rows)} entries updated.")
       :ok
     else
@@ -840,20 +983,17 @@ case argv do
         IO.puts(:standard_error, """
         Created store '#{name}'.
 
-        To start the MCP server:
+        To start the MCP server (with optional global store):
           ./engram mcp #{name}
+          ./engram mcp #{name} global
 
-        To add to Claude Code:
-          claude mcp add engram -- ./engram mcp #{name}
-
-        Or add directly to ~/.claude.json:
-          "<project-root>": {
+        To add to .mcp.json (recommended):
+          {
             "mcpServers": {
               "engram": {
                 "type": "stdio",
                 "command": "./engram",
-                "args": ["mcp", "#{name}"],
-                "env": {}
+                "args": ["mcp", "#{name}", "global"]
               }
             }
           }
@@ -864,29 +1004,36 @@ case argv do
     end
 
   ["remove", name] ->
-    IO.write(:standard_error, "Remove store '#{name}'? This cannot be undone. [y/N] ")
+    with :ok <- Store.open_db() do
+      IO.write(:standard_error, "Remove store '#{name}'? This cannot be undone. [y/N] ")
 
-    case IO.read(:stdio, :line) do
-      line when is_binary(line) ->
-        if String.trim(line) |> String.downcase() == "y" do
-          case Store.remove_store(name) do
-            :ok -> App.info("Removed store '#{name}'")
-            {:error, reason} -> App.error(reason)
+      case IO.read(:stdio, :line) do
+        line when is_binary(line) ->
+          if String.trim(line) |> String.downcase() == "y" do
+            case Store.remove_store(name) do
+              :ok -> App.info("Removed store '#{name}'")
+              {:error, reason} -> App.error(reason)
+            end
+          else
+            App.info("Cancelled.")
           end
-        else
-          App.info("Cancelled.")
-        end
 
-      _ ->
-        App.info("Cancelled.")
+        _ ->
+          App.info("Cancelled.")
+      end
+    else
+      {:error, reason} ->
+        App.error(reason)
+        System.halt(1)
     end
 
   ["duplicates", name] ->
-    with :ok <- Store.open(name) do
+    with :ok <- Store.open_db(),
+         :ok <- Store.validate_stores([name]) do
       Nx.global_default_backend(EXLA.Backend)
       Embeddings.start()
 
-      case Store.find_duplicates() do
+      case Store.find_duplicates(name) do
         {:ok, []} ->
           IO.puts("No unusually similar memories found.")
 
@@ -906,11 +1053,12 @@ case argv do
     end
 
   ["reindex", name] ->
-    with :ok <- Store.open(name) do
+    with :ok <- Store.open_db(),
+         :ok <- Store.validate_stores([name]) do
       Nx.global_default_backend(EXLA.Backend)
       Embeddings.start()
 
-      case Store.reindex() do
+      case Store.reindex(name) do
         :ok -> :ok
         {:error, reason} -> App.error(reason)
       end
@@ -920,14 +1068,15 @@ case argv do
         System.halt(1)
     end
 
-  ["mcp", name] ->
-    case Store.open(name) do
-      :ok ->
-        App.info("Using store '#{name}'")
-        Nx.global_default_backend(EXLA.Backend)
-        Embeddings.start()
-        McpServer.run()
-
+  ["mcp" | stores] when stores != [] ->
+    with :ok <- Store.open_db(),
+         :ok <- Store.validate_stores(stores) do
+      State.stores(stores)
+      App.info("Serving stores: #{Enum.join(stores, ", ")}")
+      Nx.global_default_backend(EXLA.Backend)
+      Embeddings.start()
+      McpServer.run()
+    else
       {:error, reason} ->
         App.error(reason)
         System.halt(1)
