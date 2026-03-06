@@ -163,26 +163,43 @@ defmodule StoreMemories do
   def spec() do
     %{
       name: "remember",
-      description: "Persists a piece of information in the current store",
+      description: "Persists a piece of information in the current store. " <>
+        "Before writing, always use recall to check for existing similar memories. " <>
+        "If one exists, read it and use overwrite: true to update it rather than creating a duplicate. " <>
+        "Each memory should be focused on a single topic. Write memories as reference material " <>
+        "for a future instance of yourself with zero context about the current session.",
       inputSchema: %{
         type: "object",
         required: ["label", "data"],
         properties: %{
           label: %{
             type: "string",
-            description: "A label for the information to remember"
+            description: "A short, descriptive title for the memory. Used for deduplication (memories with the same label in the same store are considered the same entry)."
           },
           data: %{
             type: "string",
-            description: "The information to remember"
+            description: "The information to remember. Should be self-contained and understandable without session context."
           },
           overwrite: %{
             type: "boolean",
-            description: "Set to true to overwrite an existing memory with the same label"
+            description: "Set to true to overwrite an existing memory with the same label. Required when updating an existing memory."
           },
           store: %{
             type: "string",
             description: "Which store to write to (defaults to the primary project store)"
+          },
+          branch: %{
+            type: "string",
+            description: "Git branch this memory is scoped to. Omit for project-wide memories that apply regardless of branch. " <>
+              "Set to the current branch name for context that is only relevant to work on that branch (e.g. feature design decisions, WIP notes, branch-specific workarounds)."
+          },
+          confidence: %{
+            type: "integer",
+            description: "How well-established this observation is, on a scale of 1-10. " <>
+              "1-2: single ambiguous signal. 3-4: weak pattern, 1-2 consistent signals. " <>
+              "5-6: moderate, several consistent signals. 7-8: strong pattern, confirmed across contexts. " <>
+              "9: explicitly stated or consistently demonstrated. 10: definitional, declared as a hard constraint. " <>
+              "When updating an existing memory, adjust the confidence based on accumulated evidence."
           }
         }
       }
@@ -193,8 +210,12 @@ defmodule StoreMemories do
   def call(%{"label" => label, "data" => data} = args) do
     store = Map.get(args, "store", State.default_store())
     overwrite = Map.get(args, "overwrite", false)
+    branch = Map.get(args, "branch")
+    confidence = Map.get(args, "confidence")
 
-    case Store.write(store, label, data, overwrite: overwrite) do
+    opts = [overwrite: overwrite, branch: branch, confidence: confidence]
+
+    case Store.write(store, label, data, opts) do
       :ok -> {:ok, "'#{label}' has been remembered in store '#{store}'"}
       {:error, reason} -> {:error, reason}
     end
@@ -208,7 +229,8 @@ defmodule ListMemories do
   def spec() do
     %{
       name: "list",
-      description: "Lists all entries in the current store",
+      description: "Lists all memory labels in a store with their metadata. " <>
+        "Use this at session startup to see what's available without pulling everything into context.",
       inputSchema: %{
         type: "object",
         properties: %{
@@ -226,9 +248,32 @@ defmodule ListMemories do
     store = Map.get(args, "store", State.default_store())
 
     Store.list_entries(store)
-    |> Enum.map(&"[#{store}] #{&1}")
+    |> Enum.map(&format_entry(store, &1))
     |> Enum.join("\n")
     |> then(&{:ok, &1})
+  end
+
+  defp format_entry(store, %{label: label, branch: branch, confidence: confidence, updated_at: updated_at}) do
+    scope =
+      if branch do
+        "[#{store}:#{branch}]"
+      else
+        "[#{store}]"
+      end
+
+    meta =
+      [
+        if(confidence, do: "c:#{confidence}"),
+        if(updated_at, do: updated_at)
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join(" ")
+
+    if meta == "" do
+      "#{scope} #{label}"
+    else
+      "#{scope} #{label} (#{meta})"
+    end
   end
 end
 
@@ -239,7 +284,9 @@ defmodule RecallMemories do
   def spec() do
     %{
       name: "recall",
-      description: "Recalls information from all active stores relevant to a query",
+      description: "Recalls information from all active stores relevant to a query. " <>
+        "Searches semantically across all stores in this session. " <>
+        "When a branch is specified, returns both branch-specific and project-wide (unscoped) memories.",
       inputSchema: %{
         type: "object",
         required: ["query"],
@@ -247,6 +294,11 @@ defmodule RecallMemories do
           query: %{
             type: "string",
             description: "A query to recall relevant information for"
+          },
+          branch: %{
+            type: "string",
+            description: "Filter results to this branch plus project-wide (unscoped) memories. " <>
+              "Omit to search all memories regardless of branch."
           }
         }
       }
@@ -254,13 +306,29 @@ defmodule RecallMemories do
   end
 
   @impl true
-  def call(%{"query" => query}) do
-    with {:ok, results} <- Store.search(query) do
+  def call(%{"query" => query} = args) do
+    branch = Map.get(args, "branch")
+    opts = if branch, do: [branch: branch], else: []
+
+    with {:ok, results} <- Store.search(query, opts) do
       results
-      |> Enum.map(fn {_score, entry} -> entry end)
+      |> Enum.map(fn {_score, entry} -> format_result(entry) end)
       |> Enum.join("\n\n-----\n\n")
       |> then(&{:ok, &1})
     end
+  end
+
+  defp format_result(%{content: content, store: store, branch: branch, confidence: confidence}) do
+    meta_parts =
+      [
+        "store:#{store}",
+        if(branch, do: "branch:#{branch}"),
+        if(confidence, do: "confidence:#{confidence}")
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join(" | ")
+
+    "[#{meta_parts}]\n#{content}"
   end
 end
 
@@ -342,14 +410,15 @@ defmodule ForgetMemory do
   def spec() do
     %{
       name: "forget",
-      description: "Removes a memory by label from a store",
+      description: "Removes a memory by label from a store. " <>
+        "Use when the user asks to stop remembering something, or when consolidating duplicates.",
       inputSchema: %{
         type: "object",
         required: ["label"],
         properties: %{
           label: %{
             type: "string",
-            description: "The label of the memory to remove"
+            description: "The exact label of the memory to remove"
           },
           store: %{
             type: "string",
@@ -593,6 +662,15 @@ defmodule Store do
   # and cached embeddings, scoped by store via composite primary key. The model
   # column tracks which embedding model generated the vector so we can detect
   # when a reindex is needed after a model change.
+  #
+  # branch: nullable TEXT, scopes a memory to a specific git branch. NULL means
+  # the memory applies project-wide (all branches). A specific value means the
+  # memory is only relevant when working on that branch.
+  #
+  # confidence: nullable INTEGER 1-10, tracks how well-established an
+  # observation is. NULL means unrated. See example-claude.md for the scale.
+  #
+  # created_at/updated_at: ISO 8601 timestamps for staleness detection.
   #-----------------------------------------------------------------------------
   defp migrate(db) do
     :ok = Exqlite.Sqlite3.execute(db, """
@@ -612,29 +690,73 @@ defmodule Store do
         , PRIMARY KEY (slug, store)
       )
     """)
+
+    # Additive migrations - each column is added if not already present.
+    # SQLite raises an error if the column exists, so we check first.
+    columns = table_columns(db, "entries")
+
+    unless "branch" in columns do
+      :ok = Exqlite.Sqlite3.execute(db, "ALTER TABLE entries ADD COLUMN branch TEXT")
+    end
+
+    unless "confidence" in columns do
+      :ok = Exqlite.Sqlite3.execute(db, "ALTER TABLE entries ADD COLUMN confidence INTEGER")
+    end
+
+    unless "created_at" in columns do
+      :ok = Exqlite.Sqlite3.execute(db, """
+        ALTER TABLE entries ADD COLUMN created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      """)
+    end
+
+    unless "updated_at" in columns do
+      :ok = Exqlite.Sqlite3.execute(db, """
+        ALTER TABLE entries ADD COLUMN updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      """)
+    end
+
+    :ok
+  end
+
+  defp table_columns(db, table) do
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "PRAGMA table_info(#{table})")
+    {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
+    :ok = Exqlite.Sqlite3.release(db, stmt)
+    Enum.map(rows, fn [_cid, name | _rest] -> name end)
   end
 
   #-----------------------------------------------------------------------------
   # Entry operations -- all scoped by store name. When called from MCP tools,
   # the store defaults to State.default_store() if not specified.
   #-----------------------------------------------------------------------------
+  # Returns a list of entry maps with label, branch, confidence, and timestamps.
   def list_entries(store) do
     db = State.db()
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT label FROM entries WHERE store = ?1 ORDER BY label")
+
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, """
+      SELECT label, branch, confidence, updated_at
+      FROM entries WHERE store = ?1 ORDER BY label
+    """)
+
     :ok = Exqlite.Sqlite3.bind(stmt, [store])
     {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
     :ok = Exqlite.Sqlite3.release(db, stmt)
-    rows |> Enum.map(fn [label] -> label end)
+
+    Enum.map(rows, fn [label, branch, confidence, updated_at] ->
+      %{label: label, branch: branch, confidence: confidence, updated_at: updated_at}
+    end)
   end
 
   def write(store, label, data, opts \\ []) do
     slug = slugify(label)
     content = "# #{label}\n\n#{data}"
     overwrite = Keyword.get(opts, :overwrite, false)
+    branch = Keyword.get(opts, :branch)
+    confidence = Keyword.get(opts, :confidence)
 
     with :ok <- check_overwrite(store, slug, label, overwrite),
-         {:ok, embedding} <- Embeddings.embed(content),
-         :ok <- upsert_entry(store, slug, label, content, embedding) do
+         {:ok, embedding} <- maybe_embed(store, slug, content),
+         :ok <- upsert_entry(store, slug, label, content, embedding, branch, confidence) do
       :ok
     else
       {:error, reason} when is_binary(reason) -> {:error, reason}
@@ -643,28 +765,47 @@ defmodule Store do
   end
 
   def read(store, slug) do
-    with {:ok, stmt} <- prepare_and_bind(
-           "SELECT content FROM entries WHERE slug = ?1 AND store = ?2", [slug, store]),
-         {:ok, content} <- fetch_one(stmt, slug) do
-      {:ok, content}
-    else
-      {:error, reason} when is_binary(reason) -> {:error, reason}
-      {:error, reason} -> {:error, "Failed to read '#{slug}': #{inspect(reason)}"}
-    end
+    db = State.db()
+
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, """
+      SELECT content, branch, confidence, created_at, updated_at
+      FROM entries WHERE slug = ?1 AND store = ?2
+    """)
+
+    :ok = Exqlite.Sqlite3.bind(stmt, [slug, store])
+
+    result =
+      case Exqlite.Sqlite3.step(db, stmt) do
+        {:row, [content, branch, confidence, created_at, updated_at]} ->
+          {:ok, %{
+            content: content, branch: branch, confidence: confidence,
+            created_at: created_at, updated_at: updated_at
+          }}
+
+        :done ->
+          {:error, "Entry '#{slug}' not found."}
+      end
+
+    :ok = Exqlite.Sqlite3.release(db, stmt)
+    result
   end
 
   # Searches across all active stores (as listed in State.stores()). Results
-  # from all stores are merged and ranked by similarity score.
-  def search(query, max_results \\ @max_results) do
+  # from all stores are merged and ranked by similarity score. When a branch
+  # is specified, results include both branch-specific and project-wide
+  # (branch IS NULL) entries.
+  def search(query, opts \\ []) do
     stores = State.stores()
+    max_results = Keyword.get(opts, :max_results, @max_results)
+    branch = Keyword.get(opts, :branch)
 
     with {:ok, query_embedding} <- Embeddings.embed(query),
-         {:ok, rows} <- fetch_all_embeddings(stores) do
+         {:ok, rows} <- fetch_all_embeddings(stores, branch) do
       rows
-      |> Enum.map(fn [content, embedding_blob] ->
+      |> Enum.map(fn [content, embedding_blob, store, entry_branch, confidence] ->
         embedding = :erlang.binary_to_term(embedding_blob)
         score = Embeddings.tensor_similarity(query_embedding, embedding)
-        {score, content}
+        {score, %{content: content, store: store, branch: entry_branch, confidence: confidence}}
       end)
       |> Enum.sort_by(&elem(&1, 0), :desc)
       |> Enum.take(max_results)
@@ -700,28 +841,6 @@ defmodule Store do
     end
   end
 
-  defp prepare_and_bind(sql, params) do
-    db = State.db()
-
-    with {:ok, stmt} <- Exqlite.Sqlite3.prepare(db, sql),
-         :ok <- Exqlite.Sqlite3.bind(stmt, params) do
-      {:ok, stmt}
-    end
-  end
-
-  defp fetch_one(stmt, slug) do
-    db = State.db()
-
-    result =
-      case Exqlite.Sqlite3.step(db, stmt) do
-        {:row, [value]} -> {:ok, value}
-        :done -> {:error, "Entry '#{slug}' not found."}
-      end
-
-    :ok = Exqlite.Sqlite3.release(db, stmt)
-    result
-  end
-
   defp entry_exists?(store, slug) do
     db = State.db()
 
@@ -733,21 +852,64 @@ defmodule Store do
     match?({:row, _}, result)
   end
 
-  defp upsert_entry(store, slug, label, content, embedding) do
+  # Skips embedding when the content hasn't changed - avoids expensive model
+  # inference for metadata-only updates (e.g. confidence bump). Returns the
+  # existing embedding if content matches, or computes a new one.
+  defp maybe_embed(store, slug, content) do
+    case fetch_existing(store, slug) do
+      {:ok, existing_content, existing_embedding} when existing_content == content ->
+        {:ok, existing_embedding}
+
+      _ ->
+        Embeddings.embed(content)
+    end
+  end
+
+  defp fetch_existing(store, slug) do
+    db = State.db()
+
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db,
+      "SELECT content, embedding FROM entries WHERE slug = ?1 AND store = ?2"
+    )
+
+    :ok = Exqlite.Sqlite3.bind(stmt, [slug, store])
+
+    result =
+      case Exqlite.Sqlite3.step(db, stmt) do
+        {:row, [content, blob]} when not is_nil(blob) ->
+          {:ok, content, :erlang.binary_to_term(blob)}
+
+        _ ->
+          :not_found
+      end
+
+    :ok = Exqlite.Sqlite3.release(db, stmt)
+    result
+  end
+
+  defp upsert_entry(store, slug, label, content, embedding, branch, confidence) do
     db = State.db()
     blob = {:blob, :erlang.term_to_binary(embedding)}
+    now = DateTime.utc_now() |> DateTime.to_iso8601()
 
     {:ok, stmt} = Exqlite.Sqlite3.prepare(db, """
-      INSERT INTO entries (slug, store, label, content, embedding, model)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      INSERT INTO entries (slug, store, label, content, embedding, model, branch, confidence, created_at, updated_at)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
       ON CONFLICT(slug, store) DO UPDATE SET
         label = excluded.label,
         content = excluded.content,
         embedding = excluded.embedding,
-        model = excluded.model
+        model = excluded.model,
+        branch = COALESCE(excluded.branch, entries.branch),
+        confidence = COALESCE(excluded.confidence, entries.confidence),
+        updated_at = excluded.updated_at
     """)
 
-    :ok = Exqlite.Sqlite3.bind(stmt, [slug, store, label, content, blob, Embeddings.model()])
+    :ok = Exqlite.Sqlite3.bind(stmt, [
+      slug, store, label, content, blob, Embeddings.model(),
+      branch, confidence, now
+    ])
+
     :done = Exqlite.Sqlite3.step(db, stmt)
     :ok = Exqlite.Sqlite3.release(db, stmt)
     :ok
@@ -765,16 +927,29 @@ defmodule Store do
     end
   end
 
-  # Fetches embeddings across multiple stores for cross-store search
-  defp fetch_all_embeddings(stores) do
+  # Fetches embeddings across multiple stores for cross-store search.
+  # When branch is non-nil, includes entries matching that branch OR
+  # entries with no branch (project-wide). When nil, returns all entries.
+  defp fetch_all_embeddings(stores, branch) do
     db = State.db()
-    placeholders = stores |> Enum.with_index(1) |> Enum.map(fn {_, i} -> "?#{i}" end) |> Enum.join(", ")
+    store_placeholders = stores |> Enum.with_index(1) |> Enum.map(fn {_, i} -> "?#{i}" end) |> Enum.join(", ")
 
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db,
-      "SELECT content, embedding FROM entries WHERE embedding IS NOT NULL AND store IN (#{placeholders})"
-    )
+    {sql, params} =
+      if branch do
+        n = length(stores) + 1
 
-    :ok = Exqlite.Sqlite3.bind(stmt, stores)
+        {"SELECT content, embedding, store, branch, confidence FROM entries " <>
+         "WHERE embedding IS NOT NULL AND store IN (#{store_placeholders}) " <>
+         "AND (branch IS NULL OR branch = ?#{n})",
+         stores ++ [branch]}
+      else
+        {"SELECT content, embedding, store, branch, confidence FROM entries " <>
+         "WHERE embedding IS NOT NULL AND store IN (#{store_placeholders})",
+         stores}
+      end
+
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
+    :ok = Exqlite.Sqlite3.bind(stmt, params)
     {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
     :ok = Exqlite.Sqlite3.release(db, stmt)
     {:ok, rows}
