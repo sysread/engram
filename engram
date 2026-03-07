@@ -457,12 +457,15 @@ defmodule App do
       --verbose | -v      Enable verbose output
 
     COMMANDS
-      list                     List existing stores
-      create      <name>       Create a new store
-      remove      <name>       Remove a store
-      reindex     <name>       Regenerate all embeddings
-      duplicates  <name>       Find memories with similar content
-      mcp         <name> ...   Start the MCP server with one or more stores (transport: stdio)
+      list                              List existing stores
+      create      <name>                Create a new store
+      remove      <name>                Remove a store
+      reindex     <name>                Regenerate all embeddings
+      duplicates  <name>                Find memories with similar content
+      show        <name> <slug>          Display a single memory by slug
+      dump        <name> ...            Output all memories for one or more stores
+      search      <name> ... -- <query> Semantic search across one or more stores
+      mcp         <name> ...            Start the MCP server (stdio transport)
 
     EXAMPLES
       # Create stores for a project
@@ -509,6 +512,13 @@ defmodule App do
   def error(msg, extra), do: log(:error, msg, extra)
   def warn(msg), do: log(:warn, msg)
   def warn(msg, extra), do: log(:warn, msg, extra)
+
+  # Writes directly to stderr and halts. Logger.log is async and
+  # System.halt kills the VM before the handler flushes its buffer.
+  def fatal(msg) do
+    IO.puts(:standard_error, "error: #{msg}")
+    System.halt(1)
+  end
 end
 
 #-------------------------------------------------------------------------------
@@ -774,7 +784,7 @@ defmodule Store do
     db = State.db()
 
     {:ok, stmt} = Exqlite.Sqlite3.prepare(db, """
-      SELECT content, branch, confidence, created_at, updated_at
+      SELECT label, content, branch, confidence, created_at, updated_at
       FROM entries WHERE slug = ?1 AND store = ?2
     """)
 
@@ -782,9 +792,9 @@ defmodule Store do
 
     result =
       case Exqlite.Sqlite3.step(db, stmt) do
-        {:row, [content, branch, confidence, created_at, updated_at]} ->
+        {:row, [label, content, branch, confidence, created_at, updated_at]} ->
           {:ok, %{
-            content: content, branch: branch, confidence: confidence,
+            label: label, content: content, branch: branch, confidence: confidence,
             created_at: created_at, updated_at: updated_at
           }}
 
@@ -808,10 +818,10 @@ defmodule Store do
     with {:ok, query_embedding} <- Embeddings.embed(query),
          {:ok, rows} <- fetch_all_embeddings(stores, branch) do
       rows
-      |> Enum.map(fn [content, embedding_blob, store, entry_branch, confidence] ->
+      |> Enum.map(fn [slug, content, embedding_blob, store, entry_branch, confidence] ->
         embedding = :erlang.binary_to_term(embedding_blob)
         score = Embeddings.tensor_similarity(query_embedding, embedding)
-        {score, %{content: content, store: store, branch: entry_branch, confidence: confidence}}
+        {score, %{slug: slug, content: content, store: store, branch: entry_branch, confidence: confidence}}
       end)
       |> Enum.sort_by(&elem(&1, 0), :desc)
       |> Enum.take(max_results)
@@ -944,12 +954,12 @@ defmodule Store do
       if branch do
         n = length(stores) + 1
 
-        {"SELECT content, embedding, store, branch, confidence FROM entries " <>
+        {"SELECT slug, content, embedding, store, branch, confidence FROM entries " <>
          "WHERE embedding IS NOT NULL AND store IN (#{store_placeholders}) " <>
          "AND (branch IS NULL OR branch = ?#{n})",
          stores ++ [branch]}
       else
-        {"SELECT content, embedding, store, branch, confidence FROM entries " <>
+        {"SELECT slug, content, embedding, store, branch, confidence FROM entries " <>
          "WHERE embedding IS NOT NULL AND store IN (#{store_placeholders})",
          stores}
       end
@@ -1018,6 +1028,34 @@ defmodule Store do
     :done = Exqlite.Sqlite3.step(db, stmt)
     :ok = Exqlite.Sqlite3.release(db, stmt)
     :ok
+  end
+
+  # Dumps all entries for the given stores, sorted by store (global first)
+  # then by updated_at. Returns a list of maps with full metadata.
+  def dump(stores) do
+    db = State.db()
+    placeholders = stores |> Enum.with_index(1) |> Enum.map(fn {_, i} -> "?#{i}" end) |> Enum.join(", ")
+
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, """
+      SELECT store, label, content, branch, confidence, created_at, updated_at
+      FROM entries
+      WHERE store IN (#{placeholders})
+      ORDER BY
+        CASE WHEN store = 'global' THEN 0 ELSE 1 END,
+        store,
+        updated_at
+    """)
+
+    :ok = Exqlite.Sqlite3.bind(stmt, stores)
+    {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
+    :ok = Exqlite.Sqlite3.release(db, stmt)
+
+    Enum.map(rows, fn [store, label, content, branch, confidence, created_at, updated_at] ->
+      %{
+        store: store, label: label, content: content, branch: branch,
+        confidence: confidence, created_at: created_at, updated_at: updated_at
+      }
+    end)
   end
 
   # Finds entries whose embeddings are unusually similar to each other,
@@ -1099,12 +1137,22 @@ defmodule Store do
     end
   end
 
+  # Strip the "# Label\n\n" heading that write() prepends to stored content,
+  # so CLI output can use its own markdown heading hierarchy.
+  def strip_content_heading(content) do
+    case String.split(content, "\n", parts: 3) do
+      ["# " <> _, "", rest] -> rest
+      _ -> content
+    end
+  end
+
   defp slugify(label) do
     label
     |> String.trim()
     |> String.downcase()
+    |> String.replace(" - ", "-_-")
     |> String.replace(~r/[^a-z0-9\s_-]/, "")
-    |> String.replace(~r/[\s_]+/, "-")
+    |> String.replace(~r/\s+/, "-")
   end
 end
 
@@ -1113,7 +1161,7 @@ end
 #-------------------------------------------------------------------------------
 {flags, argv, invalid} =
   System.argv()
-  |> OptionParser.parse(
+  |> OptionParser.parse_head(
     switches: [
       help: :boolean,
       verbose: :boolean,
@@ -1185,7 +1233,8 @@ case argv do
     end
 
   ["remove", name] ->
-    with :ok <- Store.open_db() do
+    with :ok <- Store.open_db(),
+         :ok <- Store.validate_stores([name]) do
       IO.write(:standard_error, "Remove store '#{name}'? This cannot be undone. [y/N] ")
 
       case IO.read(:stdio, :line) do
@@ -1204,8 +1253,7 @@ case argv do
       end
     else
       {:error, reason} ->
-        App.error(reason)
-        System.halt(1)
+        App.fatal(reason)
     end
 
   ["duplicates", name] ->
@@ -1229,8 +1277,7 @@ case argv do
       end
     else
       {:error, reason} ->
-        App.error(reason)
-        System.halt(1)
+        App.fatal(reason)
     end
 
   ["reindex", name] ->
@@ -1245,8 +1292,125 @@ case argv do
       end
     else
       {:error, reason} ->
-        App.error(reason)
-        System.halt(1)
+        App.fatal(reason)
+    end
+
+  ["show", store, slug] ->
+    with :ok <- Store.open_db(),
+         :ok <- Store.validate_stores([store]) do
+      case Store.read(store, slug) do
+        {:ok, entry} ->
+          scope =
+            if entry.branch do
+              "[#{store}:#{entry.branch}]"
+            else
+              "[#{store}]"
+            end
+
+          meta =
+            [
+              if(entry.confidence, do: "confidence:#{entry.confidence}"),
+              if(entry.created_at, do: "created:#{entry.created_at}"),
+              if(entry.updated_at, do: "updated:#{entry.updated_at}")
+            ]
+            |> Enum.reject(&is_nil/1)
+            |> Enum.join(" | ")
+
+          content = Store.strip_content_heading(entry.content)
+          IO.puts("# #{scope} #{entry.label}")
+          IO.puts("")
+          if meta != "", do: IO.puts("_#{meta}_\n")
+          IO.puts(content)
+
+        {:error, reason} ->
+          App.error(reason)
+      end
+    else
+      {:error, reason} ->
+        App.fatal(reason)
+    end
+
+  ["dump" | stores] when stores != [] ->
+    with :ok <- Store.open_db(),
+         :ok <- Store.validate_stores(stores) do
+      entries = Store.dump(stores)
+
+      entries
+      |> Enum.chunk_by(& &1.store)
+      |> Enum.each(fn group ->
+        store_name = hd(group).store
+        IO.puts("# #{store_name}\n")
+
+        Enum.each(group, fn entry ->
+          branch_tag = if entry.branch, do: " [#{entry.branch}]", else: ""
+
+          meta =
+            [
+              if(entry.confidence, do: "confidence:#{entry.confidence}"),
+              if(entry.updated_at, do: "updated:#{entry.updated_at}")
+            ]
+            |> Enum.reject(&is_nil/1)
+            |> Enum.join(" | ")
+
+          content = Store.strip_content_heading(entry.content)
+          IO.puts("## #{entry.label}#{branch_tag}")
+          IO.puts("")
+          if meta != "", do: IO.puts("_#{meta}_\n")
+          IO.puts(content)
+          IO.puts("\n---\n")
+        end)
+      end)
+    else
+      {:error, reason} ->
+        App.fatal(reason)
+    end
+
+  ["search" | rest] when rest != [] ->
+    {stores, query_words} =
+      case Enum.split_while(rest, &(&1 != "--")) do
+        {stores, ["--" | words]} when stores != [] and words != [] -> {stores, words}
+        _ ->
+          App.fatal("Usage: engram search <store> [<store> ...] -- <query>")
+      end
+
+    query = Enum.join(query_words, " ")
+
+    with :ok <- Store.open_db(),
+         :ok <- Store.validate_stores(stores) do
+      State.stores(stores)
+      Nx.global_default_backend(EXLA.Backend)
+      Embeddings.start()
+
+      case Store.search(query) do
+        {:ok, []} ->
+          IO.puts("No results.")
+
+        {:ok, results} ->
+          Enum.each(results, fn {score, entry} ->
+            scope =
+              if entry.branch do
+                "[#{entry.store}:#{entry.branch}]"
+              else
+                "[#{entry.store}]"
+              end
+
+            confidence =
+              if entry.confidence do
+                " c:#{String.pad_leading(to_string(entry.confidence), 2, "0")}"
+              else
+                ""
+              end
+
+            score_str = :io_lib.format("~.3f", [score]) |> IO.iodata_to_binary()
+            IO.puts("#{score_str} #{scope}#{confidence} #{entry.slug}")
+          end)
+
+        {:error, reason} ->
+          App.error(reason)
+      end
+    else
+      {:error, reason} ->
+        App.fatal(reason)
     end
 
   ["mcp" | stores] when stores != [] ->
@@ -1259,8 +1423,7 @@ case argv do
       McpServer.run()
     else
       {:error, reason} ->
-        App.error(reason)
-        System.halt(1)
+        App.fatal(reason)
     end
 
   _ ->
