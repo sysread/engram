@@ -715,6 +715,12 @@ defmodule Store do
       """)
     end
 
+    # The global store is always available - it holds user preferences and
+    # system knowledge shared across all projects.
+    :ok = Exqlite.Sqlite3.execute(db,
+      "INSERT OR IGNORE INTO stores (name) VALUES ('global')"
+    )
+
     :ok
   end
 
