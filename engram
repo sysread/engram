@@ -209,15 +209,18 @@ defmodule StoreMemories do
   @impl true
   def call(%{"label" => label, "data" => data} = args) do
     store = Map.get(args, "store", State.default_store())
-    overwrite = Map.get(args, "overwrite", false)
-    branch = Map.get(args, "branch")
-    confidence = Map.get(args, "confidence")
 
-    opts = [overwrite: overwrite, branch: branch, confidence: confidence]
+    with :ok <- State.authorize_store(store) do
+      overwrite = Map.get(args, "overwrite", false)
+      branch = Map.get(args, "branch")
+      confidence = Map.get(args, "confidence")
 
-    case Store.write(store, label, data, opts) do
-      :ok -> {:ok, "'#{label}' has been remembered in store '#{store}'"}
-      {:error, reason} -> {:error, reason}
+      opts = [overwrite: overwrite, branch: branch, confidence: confidence]
+
+      case Store.write(store, label, data, opts) do
+        :ok -> {:ok, "'#{label}' has been remembered in store '#{store}'"}
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 end
@@ -247,10 +250,12 @@ defmodule ListMemories do
   def call(args) do
     store = Map.get(args, "store", State.default_store())
 
-    Store.list_entries(store)
-    |> Enum.map(&format_entry(store, &1))
-    |> Enum.join("\n")
-    |> then(&{:ok, &1})
+    with :ok <- State.authorize_store(store) do
+      Store.list_entries(store)
+      |> Enum.map(&format_entry(store, &1))
+      |> Enum.join("\n")
+      |> then(&{:ok, &1})
+    end
   end
 
   defp format_entry(store, %{label: label, branch: branch, confidence: confidence, updated_at: updated_at}) do
@@ -363,7 +368,8 @@ defmodule FindDuplicateMemories do
     store = Map.get(args, "store", State.default_store())
     sensitivity = Map.get(args, "sensitivity", 1.5)
 
-    with {:ok, pairs} <- Store.find_duplicates(store, sensitivity) do
+    with :ok <- State.authorize_store(store),
+         {:ok, pairs} <- Store.find_duplicates(store, sensitivity) do
       if pairs == [] do
         {:ok, "No unusually similar memories found in store '#{store}'."}
       else
@@ -433,9 +439,11 @@ defmodule ForgetMemory do
   def call(%{"label" => label} = args) do
     store = Map.get(args, "store", State.default_store())
 
-    case Store.forget(store, label) do
-      :ok -> {:ok, "'#{label}' has been forgotten from store '#{store}'."}
-      {:error, reason} -> {:error, reason}
+    with :ok <- State.authorize_store(store) do
+      case Store.forget(store, label) do
+        :ok -> {:ok, "'#{label}' has been forgotten from store '#{store}'."}
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 end
@@ -465,7 +473,7 @@ defmodule App do
       show        <name> <slug>          Display a single memory by slug
       dump        <name> ...            Output all memories for one or more stores
       search      <name> ... -- <query> Semantic search across one or more stores
-      mcp         <name> ...            Start the MCP server (stdio transport)
+      mcp         <name> ... | --all     Start the MCP server (stdio transport)
 
     EXAMPLES
       # Create stores for a project
@@ -474,6 +482,9 @@ defmodule App do
 
       # Start MCP server with project + global stores
       engram mcp myproject global
+
+      # Start MCP server with all stores
+      engram mcp --all
 
       # Add to .mcp.json (recommended for worktree sharing)
       {
@@ -590,6 +601,16 @@ defmodule State do
 
   # The default store is the first one listed (the "primary" project store)
   def default_store(), do: stores() |> List.first()
+
+  # Guards MCP tool calls against the configured store list. Returns :ok if the
+  # store is in the active set, or {:error, reason} if not.
+  def authorize_store(store) do
+    if store in stores() do
+      :ok
+    else
+      {:error, "Store '#{store}' is not available in this session. Active stores: #{Enum.join(stores(), ", ")}"}
+    end
+  end
 end
 
 defmodule Store do
@@ -1413,14 +1434,30 @@ case argv do
         App.fatal(reason)
     end
 
-  ["mcp" | stores] when stores != [] ->
-    with :ok <- Store.open_db(),
-         :ok <- Store.validate_stores(stores) do
-      State.stores(stores)
-      App.info("Serving stores: #{Enum.join(stores, ", ")}")
-      Nx.global_default_backend(EXLA.Backend)
-      Embeddings.start()
-      McpServer.run()
+  ["mcp" | rest] when rest != [] ->
+    with :ok <- Store.open_db() do
+      # --all loads every store in the database; explicit names are validated
+      stores =
+        if "--all" in rest do
+          case Store.list_stores() do
+            {:ok, all} -> all
+            _ -> App.fatal("Failed to list stores")
+          end
+        else
+          rest
+        end
+
+      if stores == [], do: App.fatal("No stores found")
+
+      with :ok <- Store.validate_stores(stores) do
+        State.stores(stores)
+        App.info("Serving stores: #{Enum.join(stores, ", ")}")
+        Nx.global_default_backend(EXLA.Backend)
+        Embeddings.start()
+        McpServer.run()
+      else
+        {:error, reason} -> App.fatal(reason)
+      end
     else
       {:error, reason} ->
         App.fatal(reason)
