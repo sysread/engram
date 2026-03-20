@@ -170,13 +170,13 @@ defmodule StoreMemories do
         "for a future instance of yourself with zero context about the current session.",
       inputSchema: %{
         type: "object",
-        required: ["label", "data"],
+        required: ["label", "content"],
         properties: %{
           label: %{
             type: "string",
             description: "A short, descriptive title for the memory. Used for deduplication (memories with the same label in the same store are considered the same entry)."
           },
-          data: %{
+          content: %{
             type: "string",
             description: "The information to remember. Should be self-contained and understandable without session context."
           },
@@ -207,7 +207,13 @@ defmodule StoreMemories do
   end
 
   @impl true
-  def call(%{"label" => label, "data" => data} = args) do
+  def call(%{"label" => _label, "data" => _data}) do
+    {:error, "Invalid argument: use 'content' (not 'data') to pass the memory text. " <>
+      "Required fields: label (string), content (string). " <>
+      "Optional: store, branch, confidence, overwrite."}
+  end
+
+  def call(%{"label" => label, "content" => data} = args) do
     store = Map.get(args, "store", State.default_store())
 
     with :ok <- State.authorize_store(store) do
@@ -222,6 +228,11 @@ defmodule StoreMemories do
         {:error, reason} -> {:error, reason}
       end
     end
+  end
+
+  def call(_) do
+    {:error, "Missing or invalid arguments. Required: label (string), content (string). " <>
+      "Optional: store, branch, confidence, overwrite."}
   end
 end
 
