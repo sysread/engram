@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '[engram] Before responding, use engram to recall: (1) user preferences and personality from the global store, (2) project architecture and conventions from the project store, (3) if on a non-main branch, branch-scoped context. Use list_stores to see available stores, then list and recall as appropriate.'"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '[engram] After responding, check: did you learn new project knowledge, user preferences, or corrections worth persisting? If so, save to engram.'"
+          }
+        ]
+      }
+    ]
+  }
+}
