@@ -10,15 +10,6 @@ It uses `SQLite` for storage and `Bumblebee` for local embedding generation.
 - Elixir 1.16+
 - No other system dependencies
 
-## Quick Start
-
-```bash
-cd /path/to/your/project
-engram setup
-# Creates store, MCP config, prompt instructions, and hooks
-# Claude Code can now use remember, recall, and list tools
-```
-
 ## Usage
 
 ```
@@ -45,60 +36,47 @@ Add the repo directory to your `$PATH`, or symlink the `engram` script into a di
 ln -s /path/to/engram/repo/engram ~/bin/engram
 ```
 
-## Quick Setup
-
-The `setup` command configures engram for the current directory in one step:
+## Quick Start
 
 ```bash
 cd /path/to/your/project
 engram setup
 ```
 
-This creates or updates three files:
-- `.mcp.json` - MCP server configuration (shared across worktrees)
-- `CLAUDE.md` - prompt instructions for Claude Code
-- `.claude/settings.json` - session hooks for automatic recall/write
+`setup` writes to four locations:
+- `~/.claude.json` - MCP server config (per-user, keyed by directory path)
+- `.claude/CLAUDE.md` - prompt instructions for Claude Code
+- `.claude/settings.local.json` - session hooks for automatic recall/write
+- `.gitignore` - adds `.claude/` to keep local config out of version control
 
 Setup prompts you to select from existing stores or create new ones.
 A `global` store is always included automatically.
 
 Before making changes, `setup` shows a summary of what it will do and prompts for confirmation.
 
+All engram config is local to your machine.
+Nothing is written to shared project files, so teammates aren't affected.
+
 ## Manual Configuration
 
-If you prefer to configure manually, there are several options for the MCP server config.
-The key is to ensure that every instance of claude working on the same project uses the same store name (e.g., `my-project`).
-Run `engram --help` to see configuration examples with the correct absolute path to the script already filled in.
+If you prefer to configure manually:
 
 ### MCP Server
 
-Add a `.mcp.json` file to the root of your repository (recommended - shared across worktrees):
-
-```json
-{
-  "mcpServers": {
-    "engram": {
-      "type": "stdio",
-      "command": "/absolute/path/to/engram",
-      "args": ["mcp", "my-project", "global"]
-    }
-  }
-}
-```
-
-Or via the CLI:
+The MCP server config lives in `~/.claude.json`, keyed by project directory path.
+You can add it via the CLI:
 
 ```bash
-claude mcp add engram --scope project -- /absolute/path/to/engram mcp my-project global
+claude mcp add engram --scope user -- /absolute/path/to/engram mcp my-project global
 ```
 
 ### Prompt Instructions
 
-Add the contents of [example-claude.md](example-claude.md) to your `CLAUDE.md` or `~/.claude/CLAUDE.md` to instruct Claude Code on how and when to use the memory tools.
+Add the contents of [example-claude.md](example-claude.md) to `.claude/CLAUDE.md` or `~/.claude/CLAUDE.md` to instruct Claude Code on how and when to use the memory tools.
 
 ### Hooks
 
-Add the hooks from [example-hooks.json](example-hooks.json) to your Claude Code settings (`~/.claude/settings.json` or `.claude/settings.json`).
+Add the hooks from [example-hooks.json](example-hooks.json) to `.claude/settings.local.json`.
 These automate the recall/write cycle so engram use is habitual rather than opt-in:
 - **SessionStart**: recalls context from prior sessions before responding
 - **UserPromptSubmit**: evaluates each exchange for persistable knowledge
@@ -108,8 +86,8 @@ These automate the recall/write cycle so engram use is habitual rather than opt-
 The store name (e.g., `my-project`) is what determines which SQLite database engram reads and writes.
 Multiple MCP server instances can safely share the same store concurrently - SQLite handles the locking.
 
-The only thing you need to ensure is that every Claude Code instance passes the same store name.
-Using `.mcp.json` guarantees this automatically, since all worktrees read from the same file in the repo root.
+Since MCP config is in `~/.claude.json` (keyed by filesystem path), each worktree needs its own entry.
+Run `engram setup` in each worktree to configure it.
 
 ## Storage
 

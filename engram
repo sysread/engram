@@ -1207,9 +1207,12 @@ end
 # Setup command - configures engram for a project directory
 #-------------------------------------------------------------------------------
 defmodule Setup do
+  @user_config_path Path.join(System.user_home!(), ".claude.json")
+
   # Runs the interactive setup flow for the current directory. Prompts the user
-  # to select stores, then creates/updates .mcp.json, CLAUDE.md, and
-  # .claude/settings.json.
+  # to select stores, then writes MCP config to ~/.claude.json, prompt
+  # instructions to .claude/CLAUDE.md, hooks to .claude/settings.local.json,
+  # and adds .claude/ to .gitignore.
   def run(engram_path) do
     cwd = File.cwd!()
     engram_dir = Path.dirname(engram_path)
@@ -1230,15 +1233,17 @@ defmodule Setup do
     # Prompt for store selection
     store_names = prompt_stores()
 
-    # Determine what each step will do
-    mcp_json_path = Path.join(cwd, ".mcp.json")
-    claude_md_path = Path.join(cwd, "CLAUDE.md")
-    settings_dir = Path.join(cwd, ".claude")
-    settings_path = Path.join(settings_dir, "settings.json")
+    # Target paths
+    claude_dir = Path.join(cwd, ".claude")
+    claude_md_path = Path.join(claude_dir, "CLAUDE.md")
+    settings_path = Path.join(claude_dir, "settings.local.json")
+    gitignore_path = Path.join(cwd, ".gitignore")
 
-    mcp_action = plan_mcp(mcp_json_path)
+    # Plan each step
+    mcp_action = plan_mcp(cwd)
     claude_action = plan_claude_md(claude_md_path)
-    settings_action = plan_settings(settings_dir, settings_path)
+    settings_action = plan_settings(claude_dir, settings_path)
+    gitignore_action = plan_gitignore(gitignore_path)
     store_action = plan_stores(store_names)
 
     mcp_stores_label = (store_names ++ ["global"]) |> Enum.join(", ")
@@ -1248,12 +1253,18 @@ defmodule Setup do
 
     engram setup for '#{cwd}'
 
-      Stores (MCP):           #{mcp_stores_label}
-      Store changes:          #{store_action.summary}
-      .mcp.json:              #{mcp_action.summary}
-      CLAUDE.md:              #{claude_action.summary}
-      .claude/settings.json:  #{settings_action.summary}
+      Stores (MCP):                 #{mcp_stores_label}
+      Store changes:                #{store_action.summary}
+      ~/.claude.json:               #{mcp_action.summary}
+      .claude/CLAUDE.md:            #{claude_action.summary}
+      .claude/settings.local.json:  #{settings_action.summary}
+      .gitignore:                   #{gitignore_action.summary}
     """)
+
+    if gitignore_action.action != :skip do
+      IO.puts(:standard_error, "  Note: .claude/ will be gitignored. Remove the entry if you")
+      IO.puts(:standard_error, "  want to share Claude Code config with your team.\n")
+    end
 
     # Prompt for confirmation
     IO.write(:standard_error, "Proceed? [y/N] ")
@@ -1261,10 +1272,12 @@ defmodule Setup do
     case IO.read(:stdio, :line) do
       line when is_binary(line) ->
         if String.trim(line) |> String.downcase() == "y" do
-          execute(store_names, engram_path, store_action,
-                  mcp_json_path, mcp_action,
-                  claude_md_path, claude_action, example_claude,
-                  settings_dir, settings_path, settings_action, example_hooks)
+          execute_stores(store_action)
+          execute_mcp(cwd, mcp_action, engram_path, store_names)
+          ensure_claude_dir(claude_dir)
+          execute_claude_md(claude_md_path, claude_action, example_claude)
+          execute_settings(settings_path, settings_action, example_hooks)
+          execute_gitignore(gitignore_path, gitignore_action)
           App.info("Done. Restart Claude Code to pick up the new configuration.")
         else
           App.info("Cancelled.")
@@ -1375,18 +1388,19 @@ defmodule Setup do
   # Planning - determine what each step will do without side effects
   #-----------------------------------------------------------------------------
 
-  defp plan_mcp(path) do
-    if File.exists?(path) do
-      case File.read!(path) |> Jason.decode() do
+  # Plans MCP config in ~/.claude.json, keyed by project directory path.
+  defp plan_mcp(cwd) do
+    if File.exists?(@user_config_path) do
+      case File.read!(@user_config_path) |> Jason.decode() do
         {:ok, existing} ->
-          if get_in(existing, ["mcpServers", "engram"]) do
+          if get_in(existing, [cwd, "mcpServers", "engram"]) do
             %{summary: "update existing engram entry", action: :update}
           else
-            %{summary: "add engram to existing file", action: :update}
+            %{summary: "add engram entry for this directory", action: :update}
           end
 
         {:error, _} ->
-          App.fatal("#{path} contains invalid JSON")
+          App.fatal("#{@user_config_path} contains invalid JSON")
       end
     else
       %{summary: "create", action: :create}
@@ -1423,10 +1437,24 @@ defmodule Setup do
         end
 
       File.dir?(dir) ->
-        %{summary: "create settings.json", action: :create}
+        %{summary: "create", action: :create}
 
       true ->
-        %{summary: "create .claude/ directory and settings.json", action: :create_dir}
+        %{summary: "create .claude/ directory and file", action: :create}
+    end
+  end
+
+  defp plan_gitignore(path) do
+    if File.exists?(path) do
+      content = File.read!(path)
+
+      if String.contains?(content, ".claude") do
+        %{summary: "skip (already present)", action: :skip}
+      else
+        %{summary: "append .claude/", action: :append}
+      end
+    else
+      %{summary: "create", action: :create}
     end
   end
 
@@ -1456,36 +1484,30 @@ defmodule Setup do
   # Execution - apply planned changes
   #-----------------------------------------------------------------------------
 
-  defp execute(store_names, engram_path, store_action,
-               mcp_json_path, mcp_action,
-               claude_md_path, claude_action, example_claude,
-               settings_dir, settings_path, settings_action, example_hooks) do
-    execute_stores(store_action)
-    execute_mcp(mcp_json_path, mcp_action, engram_path, store_names)
-    execute_claude_md(claude_md_path, claude_action, example_claude)
-    execute_settings(settings_dir, settings_path, settings_action, example_hooks)
-  end
-
   defp execute_stores(%{to_create: names}) do
     Enum.each(names, &Store.create/1)
   end
 
-  defp execute_mcp(path, %{action: :create}, engram_path, store_names) do
-    config = %{"mcpServers" => %{"engram" => mcp_entry(engram_path, store_names)}}
-    write_json(path, config)
+  defp execute_mcp(cwd, %{action: :create}, engram_path, store_names) do
+    config = %{cwd => %{"mcpServers" => %{"engram" => mcp_entry(engram_path, store_names)}}}
+    write_json(@user_config_path, config)
   end
 
-  defp execute_mcp(path, %{action: :update}, engram_path, store_names) do
-    existing = File.read!(path) |> Jason.decode!()
+  defp execute_mcp(cwd, %{action: :update}, engram_path, store_names) do
+    existing = File.read!(@user_config_path) |> Jason.decode!()
 
     updated =
       put_in(
         existing,
-        [Access.key("mcpServers", %{}), "engram"],
+        [Access.key(cwd, %{}), Access.key("mcpServers", %{}), "engram"],
         mcp_entry(engram_path, store_names)
       )
 
-    write_json(path, updated)
+    write_json(@user_config_path, updated)
+  end
+
+  defp ensure_claude_dir(dir) do
+    File.mkdir_p!(dir)
   end
 
   defp execute_claude_md(_path, %{action: :skip}, _example), do: :ok
@@ -1498,21 +1520,29 @@ defmodule Setup do
     File.write!(path, File.read!(path) <> "\n\n" <> example)
   end
 
-  defp execute_settings(_dir, _path, %{action: :skip}, _hooks), do: :ok
+  defp execute_settings(_path, %{action: :skip}, _hooks), do: :ok
 
-  defp execute_settings(_dir, path, %{action: :create}, hooks) do
+  defp execute_settings(path, %{action: :create}, hooks) do
     write_json(path, hooks)
   end
 
-  defp execute_settings(dir, path, %{action: :create_dir}, hooks) do
-    File.mkdir_p!(dir)
-    write_json(path, hooks)
-  end
-
-  defp execute_settings(_dir, path, %{action: :update}, hooks) do
+  defp execute_settings(path, %{action: :update}, hooks) do
     existing = File.read!(path) |> Jason.decode!()
     updated = merge_hooks(existing, hooks)
     write_json(path, updated)
+  end
+
+  defp execute_gitignore(_path, %{action: :skip}), do: :ok
+
+  defp execute_gitignore(path, %{action: :create}) do
+    File.write!(path, ".claude/\n")
+  end
+
+  defp execute_gitignore(path, %{action: :append}) do
+    content = File.read!(path)
+    # Ensure there's a newline before our entry
+    separator = if String.ends_with?(content, "\n"), do: "", else: "\n"
+    File.write!(path, content <> separator <> ".claude/\n")
   end
 
   #-----------------------------------------------------------------------------
