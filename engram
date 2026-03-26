@@ -464,6 +464,8 @@ end
 #-------------------------------------------------------------------------------
 defmodule App do
   def help(exit_code \\ 0) do
+    engram_path = script_path()
+
     IO.puts(:standard_error, """
     SYNOPSIS
       engram <command> [options]
@@ -502,17 +504,35 @@ defmodule App do
         "mcpServers": {
           "engram": {
             "type": "stdio",
-            "command": "path/to/engram",
+            "command": "#{engram_path}",
             "args": ["mcp", "myproject", "global"]
           }
         }
       }
 
       # Or via claude CLI
-      claude mcp add engram --scope project -- path/to/engram mcp myproject global
+      claude mcp add engram --scope project -- #{engram_path} mcp myproject global
     """)
 
     System.halt(exit_code)
+  end
+
+  # Resolves the absolute path to this script, following symlinks.
+  defp script_path do
+    path = __ENV__.file |> Path.expand()
+
+    case File.read_link(path) do
+      {:ok, target} ->
+        # Resolve relative symlink targets against the symlink's directory
+        if Path.type(target) == :relative do
+          path |> Path.dirname() |> Path.join(target) |> Path.expand()
+        else
+          Path.expand(target)
+        end
+
+      {:error, _} ->
+        path
+    end
   end
 
   #-----------------------------------------------------------------------------

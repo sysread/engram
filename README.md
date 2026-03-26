@@ -38,10 +38,20 @@ Options:
   --verbose | -v      Enable verbose output
 ```
 
+## Installation
+
+Add the repo directory to your `$PATH`, or symlink the `engram` script into a directory already on your `$PATH`:
+
+```bash
+ln -s /path/to/engram/repo/engram ~/bin/engram
+```
+
 ## Configuration
 
 You can share the same store across multiple worktrees or directories by configuring the MCP server in one of several ways.
 The key is to ensure that every instance of claude working on the same project uses the same store name (e.g., `my-project`).
+
+Run `engram --help` to see configuration examples with the correct absolute path to the script already filled in.
 
 ### Option A: Project-scoped (shared across worktrees)
 
