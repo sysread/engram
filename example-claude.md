@@ -5,15 +5,6 @@ Use it to persist knowledge across sessions so future instances of yourself can 
 Tools are prefixed in Claude Code: `mcp__engram__remember`, `mcp__engram__recall`, `mcp__engram__list`, `mcp__engram__forget`, `mcp__engram__find_duplicates`, `mcp__engram__list_stores`.
 Bare names used below for readability.
 
-## Setup
-
-At session start, verify engram tools are accessible.
-If not, alert the user:
-```
-engram create <project-name>
-claude mcp add engram --scope project -- $(which engram) mcp <project-name> global
-```
-
 ## Stores
 
 - `global`: user preferences, personality, system environment (shared across projects)
@@ -23,14 +14,6 @@ claude mcp add engram --scope project -- $(which engram) mcp <project-name> glob
 Memories can be scoped to a git branch for transient context (feature design, WIP, PR status).
 Unscoped memories are project-wide and always included in results.
 Architecture, conventions, and user preferences are always unscoped.
-
-## Hooks
-
-Hooks automate the recall/write cycle so engram use is habitual rather than opt-in.
-Merge [example-hooks.json](example-hooks.json) into your Claude Code settings (`~/.claude/settings.json` or `.claude/settings.json`).
-
-- **SessionStart**: recall context from prior sessions before responding
-- **UserPromptSubmit**: evaluate each exchange for persistable knowledge
 
 ## Session Startup
 

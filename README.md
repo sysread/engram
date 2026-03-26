@@ -44,18 +44,15 @@ engram setup
 ```
 
 `setup` writes to four locations:
-- `~/.claude.json` - MCP server config (per-user, keyed by directory path)
+- `.mcp.json` - MCP server config
 - `.claude/CLAUDE.md` - prompt instructions for Claude Code
 - `.claude/settings.local.json` - session hooks for automatic recall/write
-- `.gitignore` - adds `.claude/` to keep local config out of version control
+- `.gitignore` - adds `.mcp.json` and `.claude/` to keep config out of version control
 
 Setup prompts you to select from existing stores or create new ones.
 A `global` store is always included automatically.
 
 Before making changes, `setup` shows a summary of what it will do and prompts for confirmation.
-
-All engram config is local to your machine.
-Nothing is written to shared project files, so teammates aren't affected.
 
 ## Manual Configuration
 
@@ -63,11 +60,18 @@ If you prefer to configure manually:
 
 ### MCP Server
 
-The MCP server config lives in `~/.claude.json`, keyed by project directory path.
-You can add it via the CLI:
+Add a `.mcp.json` file to the root of your project:
 
-```bash
-claude mcp add engram --scope user -- /absolute/path/to/engram mcp my-project global
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "type": "stdio",
+      "command": "/absolute/path/to/engram",
+      "args": ["mcp", "my-project", "global"]
+    }
+  }
+}
 ```
 
 ### Prompt Instructions
@@ -86,8 +90,7 @@ These automate the recall/write cycle so engram use is habitual rather than opt-
 The store name (e.g., `my-project`) is what determines which SQLite database engram reads and writes.
 Multiple MCP server instances can safely share the same store concurrently - SQLite handles the locking.
 
-Since MCP config is in `~/.claude.json` (keyed by filesystem path), each worktree needs its own entry.
-Run `engram setup` in each worktree to configure it.
+All worktrees share the same `.mcp.json` from the repo root, so the config is automatically consistent.
 
 ## Storage
 

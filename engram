@@ -270,26 +270,15 @@ defmodule ListMemories do
   end
 
   defp format_entry(store, %{label: label, branch: branch, confidence: confidence, updated_at: updated_at}) do
-    scope =
-      if branch do
-        "[#{store}:#{branch}]"
-      else
-        "[#{store}]"
-      end
+    scope = Store.format_scope(store, branch)
 
     meta =
-      [
-        if(confidence, do: "c:#{confidence}"),
-        if(updated_at, do: updated_at)
-      ]
-      |> Enum.reject(&is_nil/1)
-      |> Enum.join(" ")
+      Store.format_meta([
+        {confidence, &"c:#{&1}"},
+        {updated_at, & &1}
+      ])
 
-    if meta == "" do
-      "#{scope} #{label}"
-    else
-      "#{scope} #{label} (#{meta})"
-    end
+    if meta == "", do: "#{scope} #{label}", else: "#{scope} #{label} (#{meta})"
   end
 end
 
@@ -335,16 +324,14 @@ defmodule RecallMemories do
   end
 
   defp format_result(%{content: content, store: store, branch: branch, confidence: confidence}) do
-    meta_parts =
-      [
-        "store:#{store}",
-        if(branch, do: "branch:#{branch}"),
-        if(confidence, do: "confidence:#{confidence}")
-      ]
-      |> Enum.reject(&is_nil/1)
-      |> Enum.join(" | ")
+    meta =
+      Store.format_meta([
+        {store, &"store:#{&1}"},
+        {branch, &"branch:#{&1}"},
+        {confidence, &"confidence:#{&1}"}
+      ])
 
-    "[#{meta_parts}]\n#{content}"
+    "[#{meta}]\n#{content}"
   end
 end
 
@@ -495,18 +482,22 @@ defmodule App do
     System.halt(exit_code)
   end
 
-  # Resolves the absolute path to this script, following symlinks.
+  # Resolves the absolute path to this script, following symlinks recursively.
   def script_path do
-    path = __ENV__.file |> Path.expand()
+    resolve_symlinks(__ENV__.file |> Path.expand())
+  end
 
+  defp resolve_symlinks(path) do
     case File.read_link(path) do
       {:ok, target} ->
-        # Resolve relative symlink targets against the symlink's directory
-        if Path.type(target) == :relative do
-          path |> Path.dirname() |> Path.join(target) |> Path.expand()
-        else
-          Path.expand(target)
-        end
+        resolved =
+          if Path.type(target) == :relative do
+            path |> Path.dirname() |> Path.join(target) |> Path.expand()
+          else
+            Path.expand(target)
+          end
+
+        resolve_symlinks(resolved)
 
       {:error, _} ->
         path
@@ -696,11 +687,7 @@ defmodule Store do
 
   def list_stores() do
     with :ok <- open_db() do
-      db = State.db()
-      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT name FROM stores ORDER BY name")
-      {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
-      :ok = Exqlite.Sqlite3.release(db, stmt)
-      {:ok, Enum.map(rows, fn [name] -> name end)}
+      {:ok, query("SELECT name FROM stores ORDER BY name") |> Enum.map(fn [n] -> n end)}
     end
   end
 
@@ -794,18 +781,8 @@ defmodule Store do
   #-----------------------------------------------------------------------------
   # Returns a list of entry maps with label, branch, confidence, and timestamps.
   def list_entries(store) do
-    db = State.db()
-
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, """
-      SELECT label, branch, confidence, updated_at
-      FROM entries WHERE store = ?1 ORDER BY label
-    """)
-
-    :ok = Exqlite.Sqlite3.bind(stmt, [store])
-    {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
-    :ok = Exqlite.Sqlite3.release(db, stmt)
-
-    Enum.map(rows, fn [label, branch, confidence, updated_at] ->
+    query("SELECT label, branch, confidence, updated_at FROM entries WHERE store = ?1 ORDER BY label", [store])
+    |> Enum.map(fn [label, branch, confidence, updated_at] ->
       %{label: label, branch: branch, confidence: confidence, updated_at: updated_at}
     end)
   end
@@ -885,12 +862,7 @@ defmodule Store do
   # friendly messages at the boundary.
   #-----------------------------------------------------------------------------
   defp store_exists?(name) do
-    db = State.db()
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT 1 FROM stores WHERE name = ?1")
-    :ok = Exqlite.Sqlite3.bind(stmt, [name])
-    result = Exqlite.Sqlite3.step(db, stmt)
-    :ok = Exqlite.Sqlite3.release(db, stmt)
-    match?({:row, _}, result)
+    exists?("SELECT 1 FROM stores WHERE name = ?1", [name])
   end
 
   defp check_overwrite(store, slug, label, overwrite) do
@@ -905,14 +877,7 @@ defmodule Store do
   end
 
   defp entry_exists?(store, slug) do
-    db = State.db()
-
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT 1 FROM entries WHERE slug = ?1 AND store = ?2")
-    :ok = Exqlite.Sqlite3.bind(stmt, [slug, store])
-    result = Exqlite.Sqlite3.step(db, stmt)
-    :ok = Exqlite.Sqlite3.release(db, stmt)
-
-    match?({:row, _}, result)
+    exists?("SELECT 1 FROM entries WHERE slug = ?1 AND store = ?2", [slug, store])
   end
 
   # Skips embedding when the content hasn't changed - avoids expensive model
@@ -994,43 +959,29 @@ defmodule Store do
   # When branch is non-nil, includes entries matching that branch OR
   # entries with no branch (project-wide). When nil, returns all entries.
   defp fetch_all_embeddings(stores, branch) do
-    db = State.db()
-    store_placeholders = stores |> Enum.with_index(1) |> Enum.map(fn {_, i} -> "?#{i}" end) |> Enum.join(", ")
+    placeholders = stores |> Enum.with_index(1) |> Enum.map(fn {_, i} -> "?#{i}" end) |> Enum.join(", ")
 
     {sql, params} =
       if branch do
         n = length(stores) + 1
 
         {"SELECT slug, content, embedding, store, branch, confidence FROM entries " <>
-         "WHERE embedding IS NOT NULL AND store IN (#{store_placeholders}) " <>
+         "WHERE embedding IS NOT NULL AND store IN (#{placeholders}) " <>
          "AND (branch IS NULL OR branch = ?#{n})",
          stores ++ [branch]}
       else
         {"SELECT slug, content, embedding, store, branch, confidence FROM entries " <>
-         "WHERE embedding IS NOT NULL AND store IN (#{store_placeholders})",
+         "WHERE embedding IS NOT NULL AND store IN (#{placeholders})",
          stores}
       end
 
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
-    :ok = Exqlite.Sqlite3.bind(stmt, params)
-    {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
-    :ok = Exqlite.Sqlite3.release(db, stmt)
-    {:ok, rows}
+    {:ok, query(sql, params)}
   end
 
   defp fetch_all_labeled_embeddings(store) do
-    db = State.db()
-
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db,
-      "SELECT slug, label, embedding FROM entries WHERE embedding IS NOT NULL AND store = ?1"
-    )
-
-    :ok = Exqlite.Sqlite3.bind(stmt, [store])
-    {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
-    :ok = Exqlite.Sqlite3.release(db, stmt)
-
     entries =
-      Enum.map(rows, fn [slug, label, blob] ->
+      query("SELECT slug, label, embedding FROM entries WHERE embedding IS NOT NULL AND store = ?1", [store])
+      |> Enum.map(fn [slug, label, blob] ->
         %{slug: slug, label: label, embedding: :erlang.binary_to_term(blob)}
       end)
 
@@ -1038,13 +989,7 @@ defmodule Store do
   end
 
   defp fetch_all_content(store) do
-    db = State.db()
-
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "SELECT slug, content FROM entries WHERE store = ?1")
-    :ok = Exqlite.Sqlite3.bind(stmt, [store])
-    {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
-    :ok = Exqlite.Sqlite3.release(db, stmt)
-    {:ok, rows}
+    {:ok, query("SELECT slug, content FROM entries WHERE store = ?1", [store])}
   end
 
   defp reindex_entries(store, rows) do
@@ -1077,13 +1022,45 @@ defmodule Store do
     :ok
   end
 
+  # Runs a SELECT query and returns all rows as a list of lists.
+  defp query(sql, params \\ []) do
+    db = State.db()
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
+    :ok = Exqlite.Sqlite3.bind(stmt, params)
+    {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
+    :ok = Exqlite.Sqlite3.release(db, stmt)
+    rows
+  end
+
+  # Returns true if the query matches at least one row.
+  defp exists?(sql, params) do
+    db = State.db()
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, sql)
+    :ok = Exqlite.Sqlite3.bind(stmt, params)
+    result = Exqlite.Sqlite3.step(db, stmt)
+    :ok = Exqlite.Sqlite3.release(db, stmt)
+    match?({:row, _}, result)
+  end
+
+  # Formats a store/branch scope tag, e.g. "[mystore]" or "[mystore:main]".
+  def format_scope(store, nil), do: "[#{store}]"
+  def format_scope(store, branch), do: "[#{store}:#{branch}]"
+
+  # Builds a metadata string from a list of {value, formatter} pairs.
+  # Nil values are skipped. Returns empty string if no values are present.
+  def format_meta(pairs) do
+    pairs
+    |> Enum.reject(fn {v, _} -> is_nil(v) end)
+    |> Enum.map(fn {v, fmt} -> fmt.(v) end)
+    |> Enum.join(" | ")
+  end
+
   # Dumps all entries for the given stores, sorted by store (global first)
   # then by updated_at. Returns a list of maps with full metadata.
   def dump(stores) do
-    db = State.db()
     placeholders = stores |> Enum.with_index(1) |> Enum.map(fn {_, i} -> "?#{i}" end) |> Enum.join(", ")
 
-    {:ok, stmt} = Exqlite.Sqlite3.prepare(db, """
+    query("""
       SELECT store, label, content, branch, confidence, created_at, updated_at
       FROM entries
       WHERE store IN (#{placeholders})
@@ -1091,13 +1068,8 @@ defmodule Store do
         CASE WHEN store = 'global' THEN 0 ELSE 1 END,
         store,
         updated_at
-    """)
-
-    :ok = Exqlite.Sqlite3.bind(stmt, stores)
-    {:ok, rows} = Exqlite.Sqlite3.fetch_all(db, stmt)
-    :ok = Exqlite.Sqlite3.release(db, stmt)
-
-    Enum.map(rows, fn [store, label, content, branch, confidence, created_at, updated_at] ->
+    """, stores)
+    |> Enum.map(fn [store, label, content, branch, confidence, created_at, updated_at] ->
       %{
         store: store, label: label, content: content, branch: branch,
         confidence: confidence, created_at: created_at, updated_at: updated_at
@@ -1207,12 +1179,10 @@ end
 # Setup command - configures engram for a project directory
 #-------------------------------------------------------------------------------
 defmodule Setup do
-  @user_config_path Path.join(System.user_home!(), ".claude.json")
-
   # Runs the interactive setup flow for the current directory. Prompts the user
-  # to select stores, then writes MCP config to ~/.claude.json, prompt
-  # instructions to .claude/CLAUDE.md, hooks to .claude/settings.local.json,
-  # and adds .claude/ to .gitignore.
+  # to select stores, then writes MCP config to .mcp.json, prompt instructions
+  # to .claude/CLAUDE.md, hooks to .claude/settings.local.json, and adds
+  # .mcp.json and .claude/ to .gitignore.
   def run(engram_path) do
     cwd = File.cwd!()
     engram_dir = Path.dirname(engram_path)
@@ -1234,13 +1204,14 @@ defmodule Setup do
     store_names = prompt_stores()
 
     # Target paths
+    mcp_json_path = Path.join(cwd, ".mcp.json")
     claude_dir = Path.join(cwd, ".claude")
     claude_md_path = Path.join(claude_dir, "CLAUDE.md")
     settings_path = Path.join(claude_dir, "settings.local.json")
     gitignore_path = Path.join(cwd, ".gitignore")
 
     # Plan each step
-    mcp_action = plan_mcp(cwd)
+    mcp_action = plan_mcp(mcp_json_path)
     claude_action = plan_claude_md(claude_md_path)
     settings_action = plan_settings(claude_dir, settings_path)
     gitignore_action = plan_gitignore(gitignore_path)
@@ -1255,15 +1226,15 @@ defmodule Setup do
 
       Stores (MCP):                 #{mcp_stores_label}
       Store changes:                #{store_action.summary}
-      ~/.claude.json:               #{mcp_action.summary}
+      .mcp.json:                    #{mcp_action.summary}
       .claude/CLAUDE.md:            #{claude_action.summary}
       .claude/settings.local.json:  #{settings_action.summary}
       .gitignore:                   #{gitignore_action.summary}
     """)
 
     if gitignore_action.action != :skip do
-      IO.puts(:standard_error, "  Note: .claude/ will be gitignored. Remove the entry if you")
-      IO.puts(:standard_error, "  want to share Claude Code config with your team.\n")
+      IO.puts(:standard_error, "  Note: .mcp.json and .claude/ will be gitignored.")
+      IO.puts(:standard_error, "  Remove from .gitignore to share with your team.\n")
     end
 
     # Prompt for confirmation
@@ -1273,7 +1244,7 @@ defmodule Setup do
       line when is_binary(line) ->
         if String.trim(line) |> String.downcase() == "y" do
           execute_stores(store_action)
-          execute_mcp(cwd, mcp_action, engram_path, store_names)
+          execute_mcp(mcp_json_path, mcp_action, engram_path, store_names)
           ensure_claude_dir(claude_dir)
           execute_claude_md(claude_md_path, claude_action, example_claude)
           execute_settings(settings_path, settings_action, example_hooks)
@@ -1388,19 +1359,18 @@ defmodule Setup do
   # Planning - determine what each step will do without side effects
   #-----------------------------------------------------------------------------
 
-  # Plans MCP config in ~/.claude.json, keyed by project directory path.
-  defp plan_mcp(cwd) do
-    if File.exists?(@user_config_path) do
-      case File.read!(@user_config_path) |> Jason.decode() do
+  defp plan_mcp(path) do
+    if File.exists?(path) do
+      case File.read!(path) |> Jason.decode() do
         {:ok, existing} ->
-          if get_in(existing, [cwd, "mcpServers", "engram"]) do
+          if get_in(existing, ["mcpServers", "engram"]) do
             %{summary: "update existing engram entry", action: :update}
           else
-            %{summary: "add engram entry for this directory", action: :update}
+            %{summary: "add engram to existing file", action: :update}
           end
 
         {:error, _} ->
-          App.fatal("#{@user_config_path} contains invalid JSON")
+          App.fatal("#{path} contains invalid JSON")
       end
     else
       %{summary: "create", action: :create}
@@ -1447,11 +1417,21 @@ defmodule Setup do
   defp plan_gitignore(path) do
     if File.exists?(path) do
       content = File.read!(path)
+      has_claude = String.contains?(content, ".claude")
+      has_mcp = String.contains?(content, ".mcp.json")
 
-      if String.contains?(content, ".claude") do
-        %{summary: "skip (already present)", action: :skip}
-      else
-        %{summary: "append .claude/", action: :append}
+      cond do
+        has_claude and has_mcp ->
+          %{summary: "skip (already present)", action: :skip}
+
+        has_claude ->
+          %{summary: "append .mcp.json", action: :append, entries: [".mcp.json"]}
+
+        has_mcp ->
+          %{summary: "append .claude/", action: :append, entries: [".claude/"]}
+
+        true ->
+          %{summary: "append .mcp.json and .claude/", action: :append, entries: [".mcp.json", ".claude/"]}
       end
     else
       %{summary: "create", action: :create}
@@ -1488,22 +1468,22 @@ defmodule Setup do
     Enum.each(names, &Store.create/1)
   end
 
-  defp execute_mcp(cwd, %{action: :create}, engram_path, store_names) do
-    config = %{cwd => %{"mcpServers" => %{"engram" => mcp_entry(engram_path, store_names)}}}
-    write_json(@user_config_path, config)
+  defp execute_mcp(path, %{action: :create}, engram_path, store_names) do
+    config = %{"mcpServers" => %{"engram" => mcp_entry(engram_path, store_names)}}
+    write_json(path, config)
   end
 
-  defp execute_mcp(cwd, %{action: :update}, engram_path, store_names) do
-    existing = File.read!(@user_config_path) |> Jason.decode!()
+  defp execute_mcp(path, %{action: :update}, engram_path, store_names) do
+    existing = File.read!(path) |> Jason.decode!()
 
     updated =
       put_in(
         existing,
-        [Access.key(cwd, %{}), Access.key("mcpServers", %{}), "engram"],
+        [Access.key("mcpServers", %{}), "engram"],
         mcp_entry(engram_path, store_names)
       )
 
-    write_json(@user_config_path, updated)
+    write_json(path, updated)
   end
 
   defp ensure_claude_dir(dir) do
@@ -1532,17 +1512,18 @@ defmodule Setup do
     write_json(path, updated)
   end
 
+  @gitignore_entries [".mcp.json", ".claude/"]
+
   defp execute_gitignore(_path, %{action: :skip}), do: :ok
 
   defp execute_gitignore(path, %{action: :create}) do
-    File.write!(path, ".claude/\n")
+    File.write!(path, Enum.join(@gitignore_entries, "\n") <> "\n")
   end
 
-  defp execute_gitignore(path, %{action: :append}) do
+  defp execute_gitignore(path, %{action: :append, entries: entries}) do
     content = File.read!(path)
-    # Ensure there's a newline before our entry
     separator = if String.ends_with?(content, "\n"), do: "", else: "\n"
-    File.write!(path, content <> separator <> ".claude/\n")
+    File.write!(path, content <> separator <> Enum.join(entries, "\n") <> "\n")
   end
 
   #-----------------------------------------------------------------------------
@@ -1746,21 +1727,14 @@ case argv do
          :ok <- Store.validate_stores([store]) do
       case Store.read(store, slug) do
         {:ok, entry} ->
-          scope =
-            if entry.branch do
-              "[#{store}:#{entry.branch}]"
-            else
-              "[#{store}]"
-            end
+          scope = Store.format_scope(store, entry.branch)
 
           meta =
-            [
-              if(entry.confidence, do: "confidence:#{entry.confidence}"),
-              if(entry.created_at, do: "created:#{entry.created_at}"),
-              if(entry.updated_at, do: "updated:#{entry.updated_at}")
-            ]
-            |> Enum.reject(&is_nil/1)
-            |> Enum.join(" | ")
+            Store.format_meta([
+              {entry.confidence, &"confidence:#{&1}"},
+              {entry.created_at, &"created:#{&1}"},
+              {entry.updated_at, &"updated:#{&1}"}
+            ])
 
           content = Store.strip_content_heading(entry.content)
           IO.puts("# #{scope} #{entry.label}")
@@ -1791,12 +1765,10 @@ case argv do
           branch_tag = if entry.branch, do: " [#{entry.branch}]", else: ""
 
           meta =
-            [
-              if(entry.confidence, do: "confidence:#{entry.confidence}"),
-              if(entry.updated_at, do: "updated:#{entry.updated_at}")
-            ]
-            |> Enum.reject(&is_nil/1)
-            |> Enum.join(" | ")
+            Store.format_meta([
+              {entry.confidence, &"confidence:#{&1}"},
+              {entry.updated_at, &"updated:#{&1}"}
+            ])
 
           content = Store.strip_content_heading(entry.content)
           IO.puts("## #{entry.label}#{branch_tag}")
