@@ -1396,10 +1396,21 @@ defmodule Setup do
       File.exists?(path) ->
         case File.read!(path) |> Jason.decode() do
           {:ok, existing} ->
-            if has_engram_hooks?(existing) do
-              %{summary: "skip (hooks already configured)", action: :skip}
-            else
-              %{summary: "add engram hooks", action: :update}
+            has_hooks = has_engram_hooks?(existing)
+            has_perm = has_engram_permission?(existing)
+
+            cond do
+              has_hooks and has_perm ->
+                %{summary: "skip (already configured)", action: :skip}
+
+              has_hooks ->
+                %{summary: "add engram permission", action: :update}
+
+              has_perm ->
+                %{summary: "add engram hooks", action: :update}
+
+              true ->
+                %{summary: "add engram hooks and permission", action: :update}
             end
 
           {:error, _} ->
@@ -1503,12 +1514,13 @@ defmodule Setup do
   defp execute_settings(_path, %{action: :skip}, _hooks), do: :ok
 
   defp execute_settings(path, %{action: :create}, hooks) do
-    write_json(path, hooks)
+    settings = merge_settings(%{}, hooks)
+    write_json(path, settings)
   end
 
   defp execute_settings(path, %{action: :update}, hooks) do
     existing = File.read!(path) |> Jason.decode!()
-    updated = merge_hooks(existing, hooks)
+    updated = merge_settings(existing, hooks)
     write_json(path, updated)
   end
 
@@ -1536,8 +1548,8 @@ defmodule Setup do
     %{"type" => "stdio", "command" => engram_path, "args" => Enum.uniq(args)}
   end
 
-  # Checks whether the settings already contain engram hooks by looking for
-  # the [engram] marker in hook command strings.
+  @engram_permission "mcp__engram"
+
   defp has_engram_hooks?(settings) do
     hooks = Map.get(settings, "hooks", %{})
 
@@ -1552,7 +1564,20 @@ defmodule Setup do
     end)
   end
 
-  # Merges engram hooks into existing settings without disturbing other hooks.
+  defp has_engram_permission?(settings) do
+    settings
+    |> get_in(["permissions", "allow"])
+    |> is_list()
+    |> then(fn true -> @engram_permission in get_in(settings, ["permissions", "allow"]); false -> false end)
+  end
+
+  # Merges engram hooks and permission into existing settings.
+  defp merge_settings(existing, source_hooks) do
+    existing
+    |> merge_hooks(source_hooks)
+    |> merge_permission()
+  end
+
   defp merge_hooks(existing, source_hooks) do
     source_hook_map = Map.get(source_hooks, "hooks", %{})
     existing_hooks = Map.get(existing, "hooks", %{})
@@ -1576,6 +1601,16 @@ defmodule Setup do
       end)
 
     Map.put(existing, "hooks", merged)
+  end
+
+  defp merge_permission(settings) do
+    allow = get_in(settings, ["permissions", "allow"]) || []
+
+    if @engram_permission in allow do
+      settings
+    else
+      put_in(settings, [Access.key("permissions", %{}), Access.key("allow", [])], allow ++ [@engram_permission])
+    end
   end
 
   defp write_json(path, data) do
