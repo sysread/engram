@@ -464,8 +464,6 @@ end
 #-------------------------------------------------------------------------------
 defmodule App do
   def help(exit_code \\ 0) do
-    engram_path = script_path()
-
     IO.puts(:standard_error, """
     SYNOPSIS
       engram <command> [options]
@@ -487,38 +485,18 @@ defmodule App do
       dump        <name> ...            Output all memories for one or more stores
       search      <name> ... -- <query> Semantic search across one or more stores
       mcp         <name> ... | --all     Start the MCP server (stdio transport)
+      setup                             Configure engram for the current directory
 
-    EXAMPLES
-      # Create stores for a project
-      engram create myproject
-      engram create global
-
-      # Start MCP server with project + global stores
-      engram mcp myproject global
-
-      # Start MCP server with all stores
-      engram mcp --all
-
-      # Add to .mcp.json (recommended for worktree sharing)
-      {
-        "mcpServers": {
-          "engram": {
-            "type": "stdio",
-            "command": "#{engram_path}",
-            "args": ["mcp", "myproject", "global"]
-          }
-        }
-      }
-
-      # Or via claude CLI
-      claude mcp add engram --scope project -- #{engram_path} mcp myproject global
+    SETUP
+      cd /path/to/myproject
+      engram setup
     """)
 
     System.halt(exit_code)
   end
 
   # Resolves the absolute path to this script, following symlinks.
-  defp script_path do
+  def script_path do
     path = __ENV__.file |> Path.expand()
 
     case File.read_link(path) do
@@ -688,8 +666,25 @@ defmodule Store do
     end
   end
 
+  def validate_name(name) do
+    cond do
+      name == "" ->
+        {:error, "Store name cannot be empty."}
+
+      String.contains?(name, " ") ->
+        {:error, "Store name cannot contain spaces: '#{name}'"}
+
+      not Regex.match?(~r/^[a-zA-Z0-9_-]+$/, name) ->
+        {:error, "Store name may only contain letters, numbers, hyphens, and underscores: '#{name}'"}
+
+      true ->
+        :ok
+    end
+  end
+
   def create(name) do
-    with :ok <- open_db() do
+    with :ok <- validate_name(name),
+         :ok <- open_db() do
       if store_exists?(name) do
         {:error, "Store '#{name}' already exists."}
       else
@@ -1209,6 +1204,375 @@ defmodule Store do
 end
 
 #-------------------------------------------------------------------------------
+# Setup command - configures engram for a project directory
+#-------------------------------------------------------------------------------
+defmodule Setup do
+  # Runs the interactive setup flow for the current directory. Prompts the user
+  # to select stores, then creates/updates .mcp.json, CLAUDE.md, and
+  # .claude/settings.json.
+  def run(engram_path) do
+    cwd = File.cwd!()
+    engram_dir = Path.dirname(engram_path)
+
+    # Locate source material
+    claude_md_src = Path.join(engram_dir, "example-claude.md")
+    hooks_src = Path.join(engram_dir, "example-hooks.json")
+
+    for path <- [claude_md_src, hooks_src] do
+      unless File.exists?(path) do
+        App.fatal("Missing #{path} - is the engram installation intact?")
+      end
+    end
+
+    example_claude = File.read!(claude_md_src)
+    example_hooks = File.read!(hooks_src) |> Jason.decode!()
+
+    # Prompt for store selection
+    store_names = prompt_stores()
+
+    # Determine what each step will do
+    mcp_json_path = Path.join(cwd, ".mcp.json")
+    claude_md_path = Path.join(cwd, "CLAUDE.md")
+    settings_dir = Path.join(cwd, ".claude")
+    settings_path = Path.join(settings_dir, "settings.json")
+
+    mcp_action = plan_mcp(mcp_json_path)
+    claude_action = plan_claude_md(claude_md_path)
+    settings_action = plan_settings(settings_dir, settings_path)
+    store_action = plan_stores(store_names)
+
+    mcp_stores_label = (store_names ++ ["global"]) |> Enum.join(", ")
+
+    # Print summary
+    IO.puts(:standard_error, """
+
+    engram setup for '#{cwd}'
+
+      Stores (MCP):           #{mcp_stores_label}
+      Store changes:          #{store_action.summary}
+      .mcp.json:              #{mcp_action.summary}
+      CLAUDE.md:              #{claude_action.summary}
+      .claude/settings.json:  #{settings_action.summary}
+    """)
+
+    # Prompt for confirmation
+    IO.write(:standard_error, "Proceed? [y/N] ")
+
+    case IO.read(:stdio, :line) do
+      line when is_binary(line) ->
+        if String.trim(line) |> String.downcase() == "y" do
+          execute(store_names, engram_path, store_action,
+                  mcp_json_path, mcp_action,
+                  claude_md_path, claude_action, example_claude,
+                  settings_dir, settings_path, settings_action, example_hooks)
+          App.info("Done. Restart Claude Code to pick up the new configuration.")
+        else
+          App.info("Cancelled.")
+        end
+
+      _ ->
+        App.info("Cancelled.")
+    end
+  end
+
+  #-----------------------------------------------------------------------------
+  # Store selection prompt
+  #-----------------------------------------------------------------------------
+
+  defp prompt_stores do
+    with :ok <- Store.open_db() do
+      existing =
+        case Store.list_stores() do
+          {:ok, stores} -> stores -- ["global"]
+          _ -> []
+        end
+
+      if existing != [] do
+        IO.puts(:standard_error, "\nExisting stores:")
+
+        Enum.each(existing, fn name ->
+          IO.puts(:standard_error, "  - #{name}")
+        end)
+
+        IO.puts(:standard_error, "")
+      end
+
+      IO.puts(:standard_error, "Enter stores separated by spaces.")
+      IO.puts(:standard_error, "Use NEW to create a new store.\n")
+      IO.write(:standard_error, "> ")
+
+      case IO.read(:stdio, :line) do
+        line when is_binary(line) ->
+          parse_store_input(line, existing)
+
+        _ ->
+          App.fatal("No input received.")
+      end
+    else
+      {:error, reason} -> App.fatal(reason)
+    end
+  end
+
+  # Parses the user's store selection input. Validates names, handles NEW
+  # tokens by prompting for a name, and returns a deduplicated list.
+  defp parse_store_input(line, existing) do
+    tokens =
+      line
+      |> String.replace(~r/["']/, "")
+      |> String.split()
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+
+    if tokens == [] do
+      App.fatal("No stores specified.")
+    end
+
+    # Expand NEW tokens into new store names, validate everything else
+    names =
+      Enum.flat_map(tokens, fn token ->
+        if String.upcase(token) == "NEW" do
+          [prompt_new_store_name()]
+        else
+          case Store.validate_name(token) do
+            :ok -> [token]
+            {:error, reason} -> App.fatal(reason)
+          end
+        end
+      end)
+
+    # Warn about names that don't exist and aren't being created
+    unknown = names -- existing
+    will_create = unknown -- ["global"]
+
+    for name <- will_create do
+      IO.puts(:standard_error, "  Will create new store '#{name}'")
+    end
+
+    Enum.uniq(names)
+  end
+
+  defp prompt_new_store_name do
+    IO.write(:standard_error, "New store name: ")
+
+    case IO.read(:stdio, :line) do
+      line when is_binary(line) ->
+        name =
+          line
+          |> String.replace(~r/["']/, "")
+          |> String.trim()
+
+        case Store.validate_name(name) do
+          :ok -> name
+          {:error, reason} -> App.fatal(reason)
+        end
+
+      _ ->
+        App.fatal("No input received.")
+    end
+  end
+
+  #-----------------------------------------------------------------------------
+  # Planning - determine what each step will do without side effects
+  #-----------------------------------------------------------------------------
+
+  defp plan_mcp(path) do
+    if File.exists?(path) do
+      case File.read!(path) |> Jason.decode() do
+        {:ok, existing} ->
+          if get_in(existing, ["mcpServers", "engram"]) do
+            %{summary: "update existing engram entry", action: :update}
+          else
+            %{summary: "add engram to existing file", action: :update}
+          end
+
+        {:error, _} ->
+          App.fatal("#{path} contains invalid JSON")
+      end
+    else
+      %{summary: "create", action: :create}
+    end
+  end
+
+  defp plan_claude_md(path) do
+    if File.exists?(path) do
+      content = File.read!(path)
+
+      if String.contains?(content, "mcp__engram__") do
+        %{summary: "skip (already configured)", action: :skip}
+      else
+        %{summary: "append engram instructions", action: :append}
+      end
+    else
+      %{summary: "create", action: :create}
+    end
+  end
+
+  defp plan_settings(dir, path) do
+    cond do
+      File.exists?(path) ->
+        case File.read!(path) |> Jason.decode() do
+          {:ok, existing} ->
+            if has_engram_hooks?(existing) do
+              %{summary: "skip (hooks already configured)", action: :skip}
+            else
+              %{summary: "add engram hooks", action: :update}
+            end
+
+          {:error, _} ->
+            App.fatal("#{path} contains invalid JSON")
+        end
+
+      File.dir?(dir) ->
+        %{summary: "create settings.json", action: :create}
+
+      true ->
+        %{summary: "create .claude/ directory and settings.json", action: :create_dir}
+    end
+  end
+
+  # Plans store creation for a list of store names plus global.
+  defp plan_stores(names) do
+    all_needed = Enum.uniq(names ++ ["global"])
+
+    existing =
+      case Store.list_stores() do
+        {:ok, s} -> s
+        _ -> []
+      end
+
+    to_create = all_needed -- existing
+    already = all_needed -- to_create
+
+    parts = []
+    parts = if to_create != [], do: parts ++ ["create #{Enum.join(to_create, ", ")}"], else: parts
+    parts = if already != [], do: parts ++ ["#{Enum.join(already, ", ")} already exist"], else: parts
+
+    summary = Enum.join(parts, "; ")
+
+    %{summary: summary, to_create: to_create}
+  end
+
+  #-----------------------------------------------------------------------------
+  # Execution - apply planned changes
+  #-----------------------------------------------------------------------------
+
+  defp execute(store_names, engram_path, store_action,
+               mcp_json_path, mcp_action,
+               claude_md_path, claude_action, example_claude,
+               settings_dir, settings_path, settings_action, example_hooks) do
+    execute_stores(store_action)
+    execute_mcp(mcp_json_path, mcp_action, engram_path, store_names)
+    execute_claude_md(claude_md_path, claude_action, example_claude)
+    execute_settings(settings_dir, settings_path, settings_action, example_hooks)
+  end
+
+  defp execute_stores(%{to_create: names}) do
+    Enum.each(names, &Store.create/1)
+  end
+
+  defp execute_mcp(path, %{action: :create}, engram_path, store_names) do
+    config = %{"mcpServers" => %{"engram" => mcp_entry(engram_path, store_names)}}
+    write_json(path, config)
+  end
+
+  defp execute_mcp(path, %{action: :update}, engram_path, store_names) do
+    existing = File.read!(path) |> Jason.decode!()
+
+    updated =
+      put_in(
+        existing,
+        [Access.key("mcpServers", %{}), "engram"],
+        mcp_entry(engram_path, store_names)
+      )
+
+    write_json(path, updated)
+  end
+
+  defp execute_claude_md(_path, %{action: :skip}, _example), do: :ok
+
+  defp execute_claude_md(path, %{action: :create}, example) do
+    File.write!(path, example)
+  end
+
+  defp execute_claude_md(path, %{action: :append}, example) do
+    File.write!(path, File.read!(path) <> "\n\n" <> example)
+  end
+
+  defp execute_settings(_dir, _path, %{action: :skip}, _hooks), do: :ok
+
+  defp execute_settings(_dir, path, %{action: :create}, hooks) do
+    write_json(path, hooks)
+  end
+
+  defp execute_settings(dir, path, %{action: :create_dir}, hooks) do
+    File.mkdir_p!(dir)
+    write_json(path, hooks)
+  end
+
+  defp execute_settings(_dir, path, %{action: :update}, hooks) do
+    existing = File.read!(path) |> Jason.decode!()
+    updated = merge_hooks(existing, hooks)
+    write_json(path, updated)
+  end
+
+  #-----------------------------------------------------------------------------
+  # Helpers
+  #-----------------------------------------------------------------------------
+
+  # Builds the MCP server entry. Always appends "global" to the store list.
+  defp mcp_entry(engram_path, store_names) do
+    args = ["mcp"] ++ store_names ++ ["global"]
+    %{"type" => "stdio", "command" => engram_path, "args" => Enum.uniq(args)}
+  end
+
+  # Checks whether the settings already contain engram hooks by looking for
+  # the [engram] marker in hook command strings.
+  defp has_engram_hooks?(settings) do
+    hooks = Map.get(settings, "hooks", %{})
+
+    Enum.all?(["SessionStart", "UserPromptSubmit"], fn event ->
+      hooks
+      |> Map.get(event, [])
+      |> Enum.any?(fn group ->
+        group
+        |> Map.get("hooks", [])
+        |> Enum.any?(fn h -> String.contains?(Map.get(h, "command", ""), "[engram]") end)
+      end)
+    end)
+  end
+
+  # Merges engram hooks into existing settings without disturbing other hooks.
+  defp merge_hooks(existing, source_hooks) do
+    source_hook_map = Map.get(source_hooks, "hooks", %{})
+    existing_hooks = Map.get(existing, "hooks", %{})
+
+    merged =
+      Enum.reduce(source_hook_map, existing_hooks, fn {event, entries}, acc ->
+        existing_entries = Map.get(acc, event, [])
+
+        already_present =
+          Enum.any?(existing_entries, fn group ->
+            group
+            |> Map.get("hooks", [])
+            |> Enum.any?(fn h -> String.contains?(Map.get(h, "command", ""), "[engram]") end)
+          end)
+
+        if already_present do
+          acc
+        else
+          Map.put(acc, event, existing_entries ++ entries)
+        end
+      end)
+
+    Map.put(existing, "hooks", merged)
+  end
+
+  defp write_json(path, data) do
+    File.write!(path, Jason.encode!(data, pretty: true) <> "\n")
+  end
+end
+
+#-------------------------------------------------------------------------------
 # Process ARGV
 #-------------------------------------------------------------------------------
 {flags, argv, invalid} =
@@ -1464,6 +1828,9 @@ case argv do
       {:error, reason} ->
         App.fatal(reason)
     end
+
+  ["setup"] ->
+    Setup.run(App.script_path())
 
   ["mcp" | rest] when rest != [] ->
     with :ok <- Store.open_db() do

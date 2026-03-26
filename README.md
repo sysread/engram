@@ -13,12 +13,10 @@ It uses `SQLite` for storage and `Bumblebee` for local embedding generation.
 ## Quick Start
 
 ```bash
-# 1. Create a store for your project
-./engram create my-project
-
-# 2. Add to Claude Code (see "Configuration" below)
-
-# 3. Claude Code can now use remember, recall, and list tools
+cd /path/to/your/project
+engram setup
+# Creates store, MCP config, prompt instructions, and hooks
+# Claude Code can now use remember, recall, and list tools
 ```
 
 ## Usage
@@ -32,6 +30,7 @@ Commands:
   remove  <name>      Remove a store
   reindex <name>      Regenerate all embeddings
   mcp     <name>      Start the MCP server (stdio transport)
+  setup               Configure engram for the current directory
 
 Options:
   --help    | -h      Show help
@@ -46,16 +45,34 @@ Add the repo directory to your `$PATH`, or symlink the `engram` script into a di
 ln -s /path/to/engram/repo/engram ~/bin/engram
 ```
 
-## Configuration
+## Quick Setup
 
-You can share the same store across multiple worktrees or directories by configuring the MCP server in one of several ways.
+The `setup` command configures engram for the current directory in one step:
+
+```bash
+cd /path/to/your/project
+engram setup
+```
+
+This creates or updates three files:
+- `.mcp.json` - MCP server configuration (shared across worktrees)
+- `CLAUDE.md` - prompt instructions for Claude Code
+- `.claude/settings.json` - session hooks for automatic recall/write
+
+Setup prompts you to select from existing stores or create new ones.
+A `global` store is always included automatically.
+
+Before making changes, `setup` shows a summary of what it will do and prompts for confirmation.
+
+## Manual Configuration
+
+If you prefer to configure manually, there are several options for the MCP server config.
 The key is to ensure that every instance of claude working on the same project uses the same store name (e.g., `my-project`).
-
 Run `engram --help` to see configuration examples with the correct absolute path to the script already filled in.
 
-### Option A: Project-scoped (shared across worktrees)
+### MCP Server
 
-Add a `.mcp.json` file to the root of your repository:
+Add a `.mcp.json` file to the root of your repository (recommended - shared across worktrees):
 
 ```json
 {
@@ -63,55 +80,36 @@ Add a `.mcp.json` file to the root of your repository:
     "engram": {
       "type": "stdio",
       "command": "/absolute/path/to/engram",
-      "args": ["mcp", "my-project"]
+      "args": ["mcp", "my-project", "global"]
     }
   }
 }
 ```
 
-### Option B: Via `claude mcp add`
+Or via the CLI:
 
 ```bash
-# Project scope -- writes to .mcp.json, shared across worktrees
-claude mcp add engram --scope project -- /absolute/path/to/engram mcp my-project
-
-# User scope -- writes to ~/.claude.json, available in all projects
-claude mcp add engram --scope user -- /absolute/path/to/engram mcp my-project
+claude mcp add engram --scope project -- /absolute/path/to/engram mcp my-project global
 ```
 
-### Option C: Direct edit of `~/.claude.json`
+### Prompt Instructions
 
-For per-project configuration outside the repo:
+Add the contents of [example-claude.md](example-claude.md) to your `CLAUDE.md` or `~/.claude/CLAUDE.md` to instruct Claude Code on how and when to use the memory tools.
 
-```json
-{
-  "/path/to/your/project": {
-    "mcpServers": {
-      "engram": {
-        "type": "stdio",
-        "command": "/absolute/path/to/engram",
-        "args": ["mcp", "my-project"]
-      }
-    }
-  }
-}
-```
+### Hooks
 
-Note: this is keyed by filesystem path.
-If you use worktrees, each worktree has a different path and would need its own entry.
-Prefer Option A instead.
+Add the hooks from [example-hooks.json](example-hooks.json) to your Claude Code settings (`~/.claude/settings.json` or `.claude/settings.json`).
+These automate the recall/write cycle so engram use is habitual rather than opt-in:
+- **SessionStart**: recalls context from prior sessions before responding
+- **UserPromptSubmit**: evaluates each exchange for persistable knowledge
 
 ## Sharing a Store Across Worktrees
 
 The store name (e.g., `my-project`) is what determines which SQLite database engram reads and writes.
-Multiple MCP server instances can safely share the same store concurrently -- SQLite handles the locking.
+Multiple MCP server instances can safely share the same store concurrently - SQLite handles the locking.
 
 The only thing you need to ensure is that every Claude Code instance passes the same store name.
-Using `.mcp.json` (Option A) guarantees this automatically, since all worktrees read from the same file in the repo root.
-
-## Instructing Claude Code to Use engram
-
-Add the contents of [example-claude.md](example-claude.md) to your `CLAUDE.md` or `~/.claude/CLAUDE.md` to instruct Claude Code on how and when to use the memory tools.
+Using `.mcp.json` guarantees this automatically, since all worktrees read from the same file in the repo root.
 
 ## Storage
 
