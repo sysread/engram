@@ -13,6 +13,14 @@ run = """
       ok=0
     fi
   done
+
+  # EXLA needs a C++ compiler to build its NIF
+  if ! command -v g++ > /dev/null 2>&1 && ! command -v c++ > /dev/null 2>&1; then
+    echo "ERROR: No C++ compiler found (g++ or c++). Needed by EXLA to compile its NIF." >&2
+    echo "  macOS: xcode-select --install" >&2
+    echo "  Ubuntu/Debian: sudo apt-get install build-essential" >&2
+    ok=0
+  fi
   [ "$ok" -eq 1 ] || exit 1
 """
 

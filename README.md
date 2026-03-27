@@ -9,8 +9,8 @@ It uses `SQLite` for storage and `Bumblebee` for local embedding generation.
 
 ## Requirements
 
-- Elixir 1.16+
-- No other system dependencies
+- Elixir 1.16+ (with Erlang/OTP)
+- C++ compiler (`g++` or `clang++`) and `make` - needed by EXLA to compile its NIF
 
 ## Usage
 
