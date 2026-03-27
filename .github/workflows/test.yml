@@ -1,0 +1,54 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  MIX_INSTALL_DIR: ~/.cache/mix/installs
+  BUMBLEBEE_CACHE_DIR: ~/.cache/bumblebee
+  BUMBLEBEE_MODEL: sentence-transformers/all-MiniLM-L12-v2
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: '1.17'
+          otp-version: '27'
+
+      - uses: mig4/setup-bats@v1
+        with:
+          bats-version: '1.13.0'
+
+      - name: Install GNU parallel
+        run: sudo apt-get install -y parallel
+
+      - name: Cache Mix.install deps
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MIX_INSTALL_DIR }}
+          key: mix-install-${{ runner.os }}-${{ hashFiles('engram') }}
+
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BUMBLEBEE_CACHE_DIR }}
+          key: bumblebee-${{ runner.os }}-${{ env.BUMBLEBEE_MODEL }}
+
+      - name: Prime caches
+        run: |
+          export ENGRAM_DATA_DIR="$(mktemp -d)"
+          ./engram search global -- "warmup" 2>/dev/null || true
+          rm -rf "$ENGRAM_DATA_DIR"
+
+      - name: Run tests
+        run: bats --jobs 4 test/
+        env:
+          BUMBLEBEE_OFFLINE: "true"

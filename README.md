@@ -1,5 +1,7 @@
 # engram
 
+[![test](https://github.com/sysread/engram/actions/workflows/test.yml/badge.svg)](https://github.com/sysread/engram/actions/workflows/test.yml)
+
 A local semantic memory store for LLMs, exposed via MCP over stdio.
 
 `engram` lets AI agents persist and recall information across sessions using semantic search over embeddings.

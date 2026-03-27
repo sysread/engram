@@ -622,7 +622,9 @@ defmodule Store do
   # scoped by a (slug, store) composite key. WAL mode enables concurrent
   # readers across multiple engram processes sharing the same db file.
   #-----------------------------------------------------------------------------
-  def base_path(), do: [System.user_home!(), ".config", "engram"] |> Path.join()
+  def base_path() do
+    System.get_env("ENGRAM_DATA_DIR") || Path.join(System.user_home!(), ".config/engram")
+  end
   defp db_path(), do: Path.join(base_path(), "engram.db")
 
   def init() do

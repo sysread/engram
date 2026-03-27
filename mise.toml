@@ -1,0 +1,28 @@
+[tools]
+bats = "latest"
+
+[tasks.check-deps]
+description = "Verify system dependencies"
+run = """
+  ok=1
+  for cmd in bats parallel; do
+    if ! command -v "$cmd" > /dev/null 2>&1; then
+      echo "ERROR: '$cmd' is not installed. Install it with your package manager (e.g. brew install $cmd)." >&2
+      ok=0
+    fi
+  done
+  [ "$ok" -eq 1 ] || exit 1
+"""
+
+[tasks.test]
+description = "Run bats tests"
+depends = ["check-deps"]
+run = "bats --jobs 4 test/"
+
+[tasks.warm-cache]
+description = "Download embedding model and elixir deps"
+run = """
+  export ENGRAM_DATA_DIR="$(mktemp -d)"
+  ./engram search global -- "warmup" 2>/dev/null || true
+  rm -rf "$ENGRAM_DATA_DIR"
+"""
