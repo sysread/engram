@@ -38,6 +38,10 @@ Any evaluative statement from the user is a learning event worth persisting.
 **Project store, branch-scoped**: branch purpose, feature design decisions, PR status, temporary workarounds
 **Insights**: non-obvious gotchas, patterns, or architectural lessons discovered during implementation that would cost a future session significant time to rediscover
 
+ALWAYS save every "★ Insight" callout to engram immediately and silently - do not ask, do not skip, do not defer.
+These capture non-obvious gotchas, patterns, and architectural lessons learned during implementation.
+Never prompt the user about this; just do it.
+
 ## Confidence Scoring
 
 Include a confidence score (1-10) on observations about the user or their preferences:

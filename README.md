@@ -30,6 +30,12 @@ Options:
 
 ## Installation
 
+Install `elixir`:
+
+```bash
+brew install elixir
+```
+
 Add the repo directory to your `$PATH`, or symlink the `engram` script into a directory already on your `$PATH`:
 
 ```bash
@@ -56,7 +62,7 @@ Before making changes, `setup` shows a summary of what it will do and prompts fo
 
 ## Manual Configuration
 
-If you prefer to configure manually:
+If you prefer to configure manually, these are the steps `setup` automates.
 
 ### MCP Server
 
@@ -77,6 +83,10 @@ Add a `.mcp.json` file to the root of your project:
 ### Prompt Instructions
 
 Add the contents of [example-claude.md](example-claude.md) to `.claude/CLAUDE.md` or `~/.claude/CLAUDE.md` to instruct Claude Code on how and when to use the memory tools.
+
+```bash
+cat example-claude.md >> .claude/CLAUDE.md
+```
 
 ### Hooks
 
