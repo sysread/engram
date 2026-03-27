@@ -536,18 +536,19 @@ end
 # Contexts
 #-------------------------------------------------------------------------------
 defmodule Embeddings do
-  @model "sentence-transformers/all-MiniLM-L12-v2"
+  @default_model "sentence-transformers/all-MiniLM-L12-v2"
   @serving_name __MODULE__
 
-  def model(), do: @model
+  def model(), do: System.get_env("ENGRAM_MODEL") || @default_model
 
   # Loads the embedding model and tokenizer from HuggingFace, then starts an
   # Nx.Serving process for batched inference. Must be called before embed/1.
   def start do
-    App.log(:info, "Loading embedding model #{@model}...")
+    model_name = model()
+    App.log(:info, "Loading embedding model #{model_name}...")
 
-    {:ok, model} = Bumblebee.load_model({:hf, @model})
-    {:ok, tokenizer} = Bumblebee.load_tokenizer({:hf, @model})
+    {:ok, model} = Bumblebee.load_model({:hf, model_name})
+    {:ok, tokenizer} = Bumblebee.load_tokenizer({:hf, model_name})
 
     serving =
       Bumblebee.Text.TextEmbedding.text_embedding(

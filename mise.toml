@@ -1,11 +1,13 @@
 [tools]
+erlang = "latest"
+elixir = "latest"
 bats = "latest"
 
 [tasks.check-deps]
 description = "Verify system dependencies"
 run = """
   ok=1
-  for cmd in bats parallel; do
+  for cmd in elixir bats parallel; do
     if ! command -v "$cmd" > /dev/null 2>&1; then
       echo "ERROR: '$cmd' is not installed. Install it with your package manager (e.g. brew install $cmd)." >&2
       ok=0
