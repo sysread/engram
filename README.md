@@ -16,12 +16,16 @@ It uses `SQLite` for storage and `Bumblebee` for local embedding generation.
 engram <command> [options]
 
 Commands:
-  list                List existing stores
-  create  <name>      Create a new store
-  remove  <name>      Remove a store
-  reindex <name>      Regenerate all embeddings
-  mcp     <name>      Start the MCP server (stdio transport)
-  setup               Configure engram for the current directory
+  list                              List existing stores
+  create      <name>                Create a new store
+  remove      <name>                Remove a store
+  reindex     <name>                Regenerate all embeddings
+  duplicates  <name>                Find memories with similar content
+  show        <name> <slug>         Display a single memory by slug
+  dump        <name> ...            Output all memories for one or more stores
+  search      <name> ... -- <query> Semantic search across one or more stores
+  mcp         <name> ... | --all    Start the MCP server (stdio transport)
+  setup                             Configure engram for the current directory
 
 Options:
   --help    | -h      Show help
