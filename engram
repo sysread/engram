@@ -463,16 +463,16 @@ defmodule App do
       --verbose | -v      Enable verbose output
 
     COMMANDS
-      list                              List existing stores
-      create      <name>                Create a new store
-      remove      <name>                Remove a store
-      reindex     <name>                Regenerate all embeddings
-      duplicates  <name>                Find memories with similar content
+      list                               List existing stores
+      create      <name>                 Create a new store
+      remove      <name>                 Remove a store
+      reindex     <name>                 Regenerate all embeddings
+      duplicates  <name>                 Find memories with similar content
       show        <name> <slug>          Display a single memory by slug
-      dump        <name> ...            Output all memories for one or more stores
-      search      <name> ... -- <query> Semantic search across one or more stores
+      dump        <name> ...             Output all memories for one or more stores
+      search      <name> ... -- <query>  Semantic search across one or more stores
       mcp         <name> ... | --all     Start the MCP server (stdio transport)
-      setup                             Configure engram for the current directory
+      setup                              Configure engram for the current directory
 
     SETUP
       cd /path/to/myproject
