@@ -1428,28 +1428,29 @@ defmodule Setup do
     end
   end
 
+  @gitignore_entries [".mcp.json", ".claude/"]
+
   defp plan_gitignore(path) do
-    if File.exists?(path) do
-      content = File.read!(path)
-      has_claude = String.contains?(content, ".claude")
-      has_mcp = String.contains?(content, ".mcp.json")
-
-      cond do
-        has_claude and has_mcp ->
-          %{summary: "skip (already present)", action: :skip}
-
-        has_claude ->
-          %{summary: "append .mcp.json", action: :append, entries: [".mcp.json"]}
-
-        has_mcp ->
-          %{summary: "append .claude/", action: :append, entries: [".claude/"]}
-
-        true ->
-          %{summary: "append .mcp.json and .claude/", action: :append, entries: [".mcp.json", ".claude/"]}
-      end
+    if not in_git_repo?() do
+      %{summary: "skip (not a git repo)", action: :skip}
     else
-      %{summary: "create", action: :create}
+      needed = Enum.reject(@gitignore_entries, &git_ignored?/1)
+
+      case {File.exists?(path), needed} do
+        {_, []} -> %{summary: "skip (already ignored)", action: :skip}
+        {true, entries} -> %{summary: "append #{Enum.join(entries, " and ")}", action: :append, entries: entries}
+        {false, _} -> %{summary: "create", action: :create}
+      end
     end
+  end
+
+  defp in_git_repo? do
+    match?({_, 0}, System.cmd("git", ["rev-parse", "--git-dir"], stderr_to_stdout: true))
+  end
+
+  # Asks git whether a path is ignored. Exit 0 = ignored, 1 = not ignored.
+  defp git_ignored?(path) do
+    match?({_, 0}, System.cmd("git", ["check-ignore", "-q", path], stderr_to_stdout: true))
   end
 
   # Plans store creation for a list of store names plus global.
@@ -1526,8 +1527,6 @@ defmodule Setup do
     updated = merge_settings(existing, hooks)
     write_json(path, updated)
   end
-
-  @gitignore_entries [".mcp.json", ".claude/"]
 
   defp execute_gitignore(_path, %{action: :skip}), do: :ok
 
