@@ -224,7 +224,7 @@ defmodule StoreMemories do
       opts = [overwrite: overwrite, branch: branch, confidence: confidence]
 
       case Store.write(store, label, data, opts) do
-        :ok -> {:ok, "'#{label}' has been remembered in store '#{store}'"}
+        :ok -> {:ok, "[saved] #{store} :: #{label}"}
         {:error, reason} -> {:error, reason}
       end
     end
@@ -369,14 +369,14 @@ defmodule FindDuplicateMemories do
     with :ok <- State.authorize_store(store),
          {:ok, pairs} <- Store.find_duplicates(store, sensitivity) do
       if pairs == [] do
-        {:ok, "No unusually similar memories found in store '#{store}'."}
+        {:ok, "[no duplicates] #{store}"}
       else
         pairs
         |> Enum.map(fn {score, label_a, label_b} ->
           "#{Float.round(score, 3)} | \"#{label_a}\" <-> \"#{label_b}\""
         end)
         |> Enum.join("\n")
-        |> then(&{:ok, "Potentially duplicate memories in '#{store}' (score | pair):\n#{&1}"})
+        |> then(&{:ok, "[duplicates] #{store}\n#{&1}"})
       end
     end
   end
@@ -439,7 +439,7 @@ defmodule ForgetMemory do
 
     with :ok <- State.authorize_store(store) do
       case Store.forget(store, label) do
-        :ok -> {:ok, "'#{label}' has been forgotten from store '#{store}'."}
+        :ok -> {:ok, "[forgotten] #{store} :: #{label}"}
         {:error, reason} -> {:error, reason}
       end
     end
@@ -954,7 +954,7 @@ defmodule Store do
       exec("DELETE FROM entries WHERE slug = ?1 AND store = ?2", [slug, store])
       :ok
     else
-      {:error, "No memory with label '#{label}' found in store '#{store}'."}
+      {:error, "[not found] #{store} :: #{label}"}
     end
   end
 
