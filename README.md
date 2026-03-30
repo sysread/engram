@@ -2,15 +2,17 @@
 
 [![test](https://github.com/sysread/engram/actions/workflows/test.yml/badge.svg)](https://github.com/sysread/engram/actions/workflows/test.yml)
 
-A local semantic memory store for LLMs, exposed via MCP over stdio.
+## Synopsis
 
-`engram` lets AI agents persist and recall information across sessions using semantic search over embeddings.
-It uses `SQLite` for storage and `Bumblebee` for local embedding generation.
+`engram` is a simple `stdio`-based MCP server that allows LLMs to store and retrieve memories locally.
 
-## Requirements
+## Description
 
-- Elixir 1.16+ (with Erlang/OTP)
-- C++ compiler (`g++` or `clang++`) and `make` - needed by EXLA to compile its NIF
+Provides an offline, local memory store for LLMs, accessible via a simple command-line interface and a `stdio` MCP server.
+Created stores may be shared between multiple applications, agents, and worktrees, allowing for consistent memory access between different LLM-powered tools, projects, and sessions.
+
+For example, `claude`'s built-in memory system is file-based and tied to the directory it's running in, so memories aren't shared across worktrees in the same repo.
+This solves that by sharing the same named store across worktrees.
 
 ## Usage
 
@@ -36,10 +38,15 @@ Options:
 
 ## Installation
 
-Install `elixir`:
+Install dependencies:
 
 ```bash
+# macOS
+xcode-select --install  # C++ compiler, skip if already installed
 brew install elixir
+
+# Ubuntu/Debian
+sudo apt-get install build-essential elixir
 ```
 
 Add the repo directory to your `$PATH`, or symlink the `engram` script into a directory already on your `$PATH`:
