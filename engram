@@ -1677,15 +1677,15 @@ case argv do
         Created store '#{name}'.
 
         To start the MCP server (with optional global store):
-          ./engram mcp #{name}
-          ./engram mcp #{name} global
+          engram mcp #{name}
+          engram mcp #{name} global
 
         To add to .mcp.json (recommended):
           {
             "mcpServers": {
               "engram": {
                 "type": "stdio",
-                "command": "./engram",
+                "command": "engram",
                 "args": ["mcp", "#{name}", "global"]
               }
             }
