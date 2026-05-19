@@ -1,6 +1,17 @@
 #!/usr/bin/env elixir
 
 #-------------------------------------------------------------------------------
+# Force standard_io to Unicode (UTF-8) mode.
+#
+# Cursor and other GUI app launchers spawn processes without locale environment
+# variables (LANG, LC_ALL, LC_CTYPE). Without them the BEAM defaults to Latin-1
+# mode, and IO.write converts non-ASCII codepoints (e.g. em-dashes in stored
+# memories) to \x{NNNN} escape sequences instead of their UTF-8 bytes. Those
+# escapes are invalid JSON and cause the MCP client to drop the connection.
+#-------------------------------------------------------------------------------
+:io.setopts(:standard_io, [{:encoding, :unicode}])
+
+#-------------------------------------------------------------------------------
 # Initialize logger
 #-------------------------------------------------------------------------------
 {:ok, cfg} = :logger.get_handler_config(:default)
@@ -92,6 +103,7 @@ defmodule McpServer do
   end
 
   defp handle_method("initialize", _), do: {:ok, @service}
+  defp handle_method("ping", _), do: {:ok, %{}}
 
   defp handle_method("tools/list", _) do
     tools()
@@ -121,6 +133,8 @@ defmodule McpServer do
         end
     end
   end
+
+  defp handle_method(method, _), do: {:error, -32601, "Method not found: #{method}"}
 
   #-----------------------------------------------------------------------------
   # Communication helpers
