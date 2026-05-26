@@ -481,7 +481,7 @@ defmodule App do
       create      <name>                 Create a new store
       remove      <name>                 Remove a store
       reindex     <name>                 Regenerate all embeddings
-      duplicates  <name>                 Find memories with similar content
+      duplicates  [-H] <name>            Find memories with similar content (TSV: score\\ta\\tb; -H adds header)
       show        <name> <slug>          Display a single memory by slug
       dump        <name> ...             Output all memories for one or more stores
       search      <name> ... -- <query>  Semantic search across one or more stores
@@ -1734,28 +1734,49 @@ case argv do
         App.fatal(reason)
     end
 
-  ["duplicates", name] ->
-    with :ok <- Store.open_db(),
-         :ok <- Store.validate_stores([name]) do
-      Nx.global_default_backend(EXLA.Backend)
-      Embeddings.start()
+  ["duplicates" | rest] ->
+    {dup_flags, dup_argv, dup_invalid} =
+      OptionParser.parse(rest,
+        switches: [header: :boolean],
+        aliases: [H: :header]
+      )
 
-      case Store.find_duplicates(name) do
-        {:ok, []} ->
-          IO.puts("No unusually similar memories found.")
+    cond do
+      dup_invalid != [] ->
+        bad = Enum.map(dup_invalid, fn {k, _} -> k end)
+        App.fatal("Unrecognized flags: #{Enum.join(bad, ", ")}")
 
-        {:ok, pairs} ->
-          IO.puts("Potentially duplicate memories:")
-          Enum.each(pairs, fn {score, label_a, label_b} ->
-            IO.puts("  #{Float.round(score, 3)} | \"#{label_a}\" <-> \"#{label_b}\"")
-          end)
+      length(dup_argv) != 1 ->
+        App.fatal("Usage: engram duplicates [--header|-H] <name>")
 
-        {:error, reason} ->
-          App.error(reason)
-      end
-    else
-      {:error, reason} ->
-        App.fatal(reason)
+      true ->
+        [name] = dup_argv
+
+        with :ok <- Store.open_db(),
+             :ok <- Store.validate_stores([name]) do
+          Nx.global_default_backend(EXLA.Backend)
+          Embeddings.start()
+
+          case Store.find_duplicates(name) do
+            {:ok, []} ->
+              IO.puts(:stderr, "No unusually similar memories found.")
+
+            {:ok, pairs} ->
+              if dup_flags[:header] do
+                IO.puts("score\ta\tb")
+              end
+
+              Enum.each(pairs, fn {score, label_a, label_b} ->
+                IO.puts("#{Float.round(score, 3)}\t#{label_a}\t#{label_b}")
+              end)
+
+            {:error, reason} ->
+              App.error(reason)
+          end
+        else
+          {:error, reason} ->
+            App.fatal(reason)
+        end
     end
 
   ["reindex", name] ->
