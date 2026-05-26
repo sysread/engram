@@ -363,7 +363,7 @@ defmodule FindDuplicateMemories do
   @impl true
   def spec() do
     %{
-      name: "find_duplicates",
+      name: "find-duplicates",
       description: "Finds memories with unusually similar content that may be candidates for consolidation. " <>
         "Uses statistical outlier detection rather than a fixed threshold, so it adapts to the embedding model's score range.",
       inputSchema: %{
@@ -410,7 +410,7 @@ defmodule ListStores do
   @impl true
   def spec() do
     %{
-      name: "list_stores",
+      name: "list-stores",
       description: "Lists the stores available in this session",
       inputSchema: %{
         type: "object",
@@ -468,6 +468,65 @@ defmodule ForgetMemory do
   end
 end
 
+defmodule ShowMemory do
+  @behaviour McpTool
+
+  @impl true
+  def spec() do
+    %{
+      name: "show",
+      description: "Returns the full content of a single memory looked up by exact label. " <>
+        "Use this to read a memory in full when `list` or `recall` has surfaced it by label.",
+      inputSchema: %{
+        type: "object",
+        required: ["label"],
+        properties: %{
+          label: %{
+            type: "string",
+            description: "The exact label of the memory to read"
+          },
+          store: %{
+            type: "string",
+            description: "Which store to read from (defaults to the primary project store)"
+          }
+        }
+      }
+    }
+  end
+
+  @impl true
+  def call(%{"label" => label} = args) do
+    store = Map.get(args, "store", State.default_store())
+    slug = Store.slugify(label)
+
+    with :ok <- State.authorize_store(store) do
+      case Store.read(store, slug) do
+        {:ok, entry} ->
+          scope = Store.format_scope(store, entry.branch)
+
+          meta =
+            Store.format_meta([
+              {entry.confidence, &"confidence:#{&1}"},
+              {entry.created_at, &"created:#{&1}"},
+              {entry.updated_at, &"updated:#{&1}"}
+            ])
+
+          header =
+            if meta == "" do
+              "#{scope} #{entry.label}"
+            else
+              "#{scope} #{entry.label} (#{meta})"
+            end
+
+          {:ok, "#{header}\n\n#{Store.strip_content_heading(entry.content)}"}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+end
+
 #-------------------------------------------------------------------------------
 # Common app bits
 #-------------------------------------------------------------------------------
@@ -485,16 +544,17 @@ defmodule App do
       --verbose | -v      Enable verbose output
 
     COMMANDS
-      list                               List existing stores
-      create      <name>                 Create a new store
-      remove      <name>                 Remove a store
-      reindex     <name>                 Regenerate all embeddings
-      duplicates  [-H] <name>            Find memories with similar content (TSV: score\\ta\\tb; -H adds header)
-      show        <name> <slug>          Display a single memory by slug
-      dump        <name> ...             Output all memories for one or more stores
-      search      <name> ... -- <query>  Semantic search across one or more stores
-      mcp         <name> ... | --all     Start the MCP server (stdio transport)
-      setup                              Configure engram for the current directory
+      list-stores                          List existing stores
+      list             <name>              List memory labels in a store
+      create           <name>              Create a new store
+      remove           <name>              Remove a store
+      reindex          <name>              Regenerate all embeddings
+      find-duplicates  [-H] <name>         Find memories with similar content (TSV: score\\ta\\tb; -H adds header)
+      show             <name> <slug>       Display a single memory by slug
+      dump             <name> ...          Output all memories for one or more stores
+      recall           <name> ... -- <q>   Semantic search across one or more stores
+      mcp              <name> ... | --all  Start the MCP server (stdio transport)
+      setup                                Configure engram for the current directory
 
     SETUP
       cd /path/to/myproject
@@ -1190,7 +1250,7 @@ defmodule Store do
     end
   end
 
-  defp slugify(label) do
+  def slugify(label) do
     label
     |> String.trim()
     |> String.downcase()
@@ -1682,7 +1742,7 @@ if flags[:help] do
 end
 
 case argv do
-  ["list"] ->
+  ["list-stores"] ->
     case Store.list_stores() do
       {:ok, []} ->
         IO.puts("No stores found. Use 'create <name>' to create one.")
@@ -1690,6 +1750,34 @@ case argv do
       {:ok, stores} ->
         IO.puts("Existing stores:")
         stores |> Enum.each(&IO.puts("  - #{&1}"))
+    end
+
+  ["list", store] ->
+    with :ok <- Store.open_db(),
+         :ok <- Store.validate_stores([store]) do
+      case Store.list_entries(store) do
+        [] ->
+          IO.puts(:standard_error, "No memories in '#{store}'.")
+
+        entries ->
+          Enum.each(entries, fn %{label: label, branch: branch, confidence: confidence, updated_at: updated_at} ->
+            scope = Store.format_scope(store, branch)
+
+            meta =
+              Store.format_meta([
+                {confidence, &"c:#{&1}"},
+                {updated_at, & &1}
+              ])
+
+            line =
+              if meta == "", do: "#{scope} #{label}", else: "#{scope} #{label} (#{meta})"
+
+            IO.puts(line)
+          end)
+      end
+    else
+      {:error, reason} ->
+        App.fatal(reason)
     end
 
   ["create", name] ->
@@ -1742,7 +1830,7 @@ case argv do
         App.fatal(reason)
     end
 
-  ["duplicates" | rest] ->
+  ["find-duplicates" | rest] ->
     {dup_flags, dup_argv, dup_invalid} =
       OptionParser.parse(rest,
         switches: [header: :boolean],
@@ -1755,7 +1843,7 @@ case argv do
         App.fatal("Unrecognized flags: #{Enum.join(bad, ", ")}")
 
       length(dup_argv) != 1 ->
-        App.fatal("Usage: engram duplicates [--header|-H] <name>")
+        App.fatal("Usage: engram find-duplicates [--header|-H] <name>")
 
       true ->
         [name] = dup_argv
@@ -1864,12 +1952,12 @@ case argv do
         App.fatal(reason)
     end
 
-  ["search" | rest] when rest != [] ->
+  ["recall" | rest] when rest != [] ->
     {stores, query_words} =
       case Enum.split_while(rest, &(&1 != "--")) do
         {stores, ["--" | words]} when stores != [] and words != [] -> {stores, words}
         _ ->
-          App.fatal("Usage: engram search <store> [<store> ...] -- <query>")
+          App.fatal("Usage: engram recall <store> [<store> ...] -- <query>")
       end
 
     query = Enum.join(query_words, " ")

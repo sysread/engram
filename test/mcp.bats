@@ -56,8 +56,8 @@ load test_helper
   } | mcp_call teststore | mcp_response_for 2)"
 
   names="$(jq -r '.result.tools[].name' <<< "$resp" | sort | tr '\n' ' ')"
-  # All six tools must be present. Order is sorted for stability.
-  [ "$names" = "find_duplicates forget list list_stores recall remember " ]
+  # All seven tools must be present. Order is sorted for stability.
+  [ "$names" = "find-duplicates forget list list-stores recall remember show " ]
 }
 
 @test "mcp tools/call with unknown tool name returns JSON-RPC error" {
@@ -117,6 +117,38 @@ load test_helper
 
   text="$(jq -r '.result.content[0].text' <<< "$resp")"
   [[ "$text" == *"Postgres"* ]]
+}
+
+@test "mcp show returns full content by exact label" {
+  "$ENGRAM" create teststore 2>/dev/null
+
+  remember="$(mcp_tool_call 2 remember '{"label":"specific-thing","content":"Detailed body text only retrievable by exact label.","store":"teststore"}')"
+  show="$(mcp_tool_call 3 show '{"label":"specific-thing","store":"teststore"}')"
+
+  resp="$({
+    mcp_init 1
+    echo "$remember"
+    echo "$show"
+  } | mcp_call teststore | mcp_response_for 3)"
+
+  text="$(jq -r '.result.content[0].text' <<< "$resp")"
+  [[ "$text" == *"specific-thing"* ]]
+  [[ "$text" == *"Detailed body text"* ]]
+}
+
+@test "mcp show with unknown label returns tool error" {
+  "$ENGRAM" create teststore 2>/dev/null
+
+  show="$(mcp_tool_call 2 show '{"label":"never-remembered","store":"teststore"}')"
+
+  resp="$({
+    mcp_init 1
+    echo "$show"
+  } | mcp_call teststore | mcp_response_for 2)"
+
+  # Missing memory is a tool-level error: returned as a normal response with
+  # isError:true, not a JSON-RPC error envelope.
+  [ "$(jq '.result.isError' <<< "$resp")" = "true" ]
 }
 
 @test "mcp recall with branch filter returns branch and unscoped memories" {

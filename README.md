@@ -20,16 +20,17 @@ This solves that by sharing the same named store across worktrees.
 engram <command> [options]
 
 Commands:
-  list                              List existing stores
-  create      <name>                Create a new store
-  remove      <name>                Remove a store
-  reindex     <name>                Regenerate all embeddings
-  duplicates  <name>                Find memories with similar content
-  show        <name> <slug>         Display a single memory by slug
-  dump        <name> ...            Output all memories for one or more stores
-  search      <name> ... -- <query> Semantic search across one or more stores
-  mcp         <name> ... | --all    Start the MCP server (stdio transport)
-  setup                             Configure engram for the current directory
+  list-stores                          List existing stores
+  list             <name>              List memory labels in a store
+  create           <name>              Create a new store
+  remove           <name>              Remove a store
+  reindex          <name>              Regenerate all embeddings
+  find-duplicates  [-H] <name>         Find memories with similar content
+  show             <name> <slug>       Display a single memory by slug
+  dump             <name> ...          Output all memories for one or more stores
+  recall           <name> ... -- <q>   Semantic search across one or more stores
+  mcp              <name> ... | --all  Start the MCP server (stdio transport)
+  setup                                Configure engram for the current directory
 
 Options:
   --help    | -h      Show help

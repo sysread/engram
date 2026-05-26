@@ -15,19 +15,19 @@ EOF
   done 2>/dev/null
 }
 
-@test "search returns results" {
+@test "recall returns results" {
   "$ENGRAM" create teststore 2>/dev/null
   populate_store teststore
 
-  run "$ENGRAM" search teststore -- "entry"
+  run "$ENGRAM" recall teststore -- "entry"
   [ "$status" -eq 0 ]
   [[ "$output" == *"[teststore]"* ]]
 }
 
-@test "search with no matches returns empty" {
+@test "recall with no matches returns empty" {
   "$ENGRAM" create teststore 2>/dev/null
 
-  run "$ENGRAM" search teststore -- "xyzzy"
+  run "$ENGRAM" recall teststore -- "xyzzy"
   [ "$status" -eq 0 ]
   [[ "$output" == *"No results"* ]]
 }
@@ -41,15 +41,15 @@ EOF
   [[ "$output" == *"Reindexing"* ]]
 }
 
-@test "duplicates runs on populated store" {
+@test "find-duplicates runs on populated store" {
   "$ENGRAM" create teststore 2>/dev/null
   populate_store teststore
 
-  run "$ENGRAM" duplicates teststore
+  run "$ENGRAM" find-duplicates teststore
   [ "$status" -eq 0 ]
 }
 
-@test "duplicates emits TSV with three fields per line" {
+@test "find-duplicates emits TSV with three fields per line" {
   "$ENGRAM" create teststore 2>/dev/null
   populate_store teststore
 
@@ -57,7 +57,7 @@ EOF
   # which would mask any logger leakage to stderr and conflate noise with
   # data.
   stdout_file="$BATS_TEST_TMPDIR/out"
-  "$ENGRAM" duplicates teststore > "$stdout_file" 2>/dev/null
+  "$ENGRAM" find-duplicates teststore > "$stdout_file" 2>/dev/null
 
   while IFS= read -r line; do
     [ -z "$line" ] && continue
@@ -69,12 +69,12 @@ EOF
   done < "$stdout_file"
 }
 
-@test "duplicates -H emits header row" {
+@test "find-duplicates -H emits header row" {
   "$ENGRAM" create teststore 2>/dev/null
   populate_store teststore
 
   stdout_file="$BATS_TEST_TMPDIR/out"
-  "$ENGRAM" duplicates -H teststore > "$stdout_file" 2>/dev/null
+  "$ENGRAM" find-duplicates -H teststore > "$stdout_file" 2>/dev/null
 
   # Header must be the first stdout line regardless of whether any
   # duplicate pairs were found.
@@ -82,13 +82,13 @@ EOF
   [ "$first" = "score	a	b" ]
 }
 
-@test "duplicates on empty store: stdout empty, notice on stderr, exit 0" {
+@test "find-duplicates on empty store: stdout empty, notice on stderr, exit 0" {
   "$ENGRAM" create teststore 2>/dev/null
 
   # Capture stdout and stderr separately. bats' `run` merges them by default.
   stdout_file="$BATS_TEST_TMPDIR/out"
   stderr_file="$BATS_TEST_TMPDIR/err"
-  "$ENGRAM" duplicates teststore > "$stdout_file" 2> "$stderr_file"
+  "$ENGRAM" find-duplicates teststore > "$stdout_file" 2> "$stderr_file"
   status=$?
 
   [ "$status" -eq 0 ]

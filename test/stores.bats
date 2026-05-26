@@ -2,8 +2,8 @@
 
 load test_helper
 
-@test "list shows global store by default" {
-  run "$ENGRAM" list
+@test "list-stores shows global store by default" {
+  run "$ENGRAM" list-stores
   [ "$status" -eq 0 ]
   [[ "$output" == *"global"* ]]
 }
@@ -14,9 +14,9 @@ load test_helper
   [[ "$output" == *"Created store"* ]]
 }
 
-@test "list shows created store" {
+@test "list-stores shows created store" {
   "$ENGRAM" create teststore 2> /dev/null
-  run "$ENGRAM" list
+  run "$ENGRAM" list-stores
   [[ "$output" == *"teststore"* ]]
 }
 
@@ -30,7 +30,7 @@ load test_helper
   "$ENGRAM" create teststore 2> /dev/null
   echo y | "$ENGRAM" remove teststore 2> /dev/null
 
-  run "$ENGRAM" list
+  run "$ENGRAM" list-stores
   [[ "$output" != *"teststore"* ]]
 }
 

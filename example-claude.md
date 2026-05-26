@@ -2,14 +2,14 @@
 
 `engram` is a semantic memory store exposed via MCP.
 Use it to persist knowledge across sessions so future instances of yourself can build on what you've already learned.
-Tools are prefixed in Claude Code: `mcp__engram__remember`, `mcp__engram__recall`, `mcp__engram__list`, `mcp__engram__forget`, `mcp__engram__find_duplicates`, `mcp__engram__list_stores`.
+Tools are prefixed in Claude Code: `mcp__engram__remember`, `mcp__engram__recall`, `mcp__engram__list`, `mcp__engram__show`, `mcp__engram__forget`, `mcp__engram__find-duplicates`, `mcp__engram__list-stores`.
 Bare names used below for readability.
 
 ## Stores
 
 - `global`: user preferences, personality, system environment (shared across projects)
 - Per-project stores: project-specific knowledge
-- Use `list_stores` to see active stores
+- Use `list-stores` to see active stores
 
 Memories can be scoped to a git branch for transient context (feature design, WIP, PR status).
 Unscoped memories are project-wide and always included in results.

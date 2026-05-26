@@ -109,7 +109,7 @@ GITIGNORE
   printf 'NEW\nbrandnew\ny\n' | "$ENGRAM" setup 2> /dev/null
 
   # Verify store was created
-  run "$ENGRAM" list
+  run "$ENGRAM" list-stores
   [[ "$output" == *"brandnew"* ]]
 
   # Verify .mcp.json references the new store
