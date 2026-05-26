@@ -30,6 +30,14 @@ Mix.install([
   {:jason, "~> 1.4"},
 ])
 
+# Mix.install starts applications that re-register the default logger handler
+# with stdout as its target. Re-apply the stderr config so log lines do not
+# pollute stdout-bound data streams (e.g. `engram duplicates | column -t`).
+{:ok, cfg} = :logger.get_handler_config(:default)
+cfg = Map.update!(cfg, :config, &Map.put(&1, :type, :standard_error))
+:ok = :logger.remove_handler(:default)
+:ok = :logger.add_handler(:default, :logger_std_h, cfg)
+
 #-------------------------------------------------------------------------------
 # Tool behaviour
 #-------------------------------------------------------------------------------
@@ -1758,17 +1766,18 @@ case argv do
           Embeddings.start()
 
           case Store.find_duplicates(name) do
-            {:ok, []} ->
-              IO.puts(:stderr, "No unusually similar memories found.")
-
             {:ok, pairs} ->
               if dup_flags[:header] do
                 IO.puts("score\ta\tb")
               end
 
-              Enum.each(pairs, fn {score, label_a, label_b} ->
-                IO.puts("#{Float.round(score, 3)}\t#{label_a}\t#{label_b}")
-              end)
+              if pairs == [] do
+                IO.puts(:stderr, "No unusually similar memories found.")
+              else
+                Enum.each(pairs, fn {score, label_a, label_b} ->
+                  IO.puts("#{Float.round(score, 3)}\t#{label_a}\t#{label_b}")
+                end)
+              end
 
             {:error, reason} ->
               App.error(reason)
