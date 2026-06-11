@@ -1211,9 +1211,6 @@ defmodule Store do
 
         {:ok, results}
       end
-    else
-      {:error, reason} when is_binary(reason) -> {:error, reason}
-      {:error, reason} -> {:error, "Duplicate search failed: #{inspect(reason)}"}
     end
   end
 
@@ -1235,9 +1232,6 @@ defmodule Store do
          :ok <- reindex_entries(store, rows) do
       App.info("Reindex complete. #{length(rows)} entries updated.")
       :ok
-    else
-      {:error, reason} when is_binary(reason) -> {:error, reason}
-      {:error, reason} -> {:error, "Reindex failed: #{inspect(reason)}"}
     end
   end
 
