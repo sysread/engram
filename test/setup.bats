@@ -12,7 +12,7 @@ load test_helper
   cd "$project_dir"
   git init -q
 
-  printf 'teststore\ny\n' | "$ENGRAM" setup 2> /dev/null
+  printf '3\nteststore\ny\n' | "$ENGRAM" setup 2> /dev/null
 
   [ -f "$project_dir/.mcp.json" ]
   [ -f "$project_dir/.claude/CLAUDE.md" ]
@@ -43,10 +43,10 @@ load test_helper
   cd "$project_dir"
   git init -q
 
-  printf 'teststore\ny\n' | "$ENGRAM" setup 2> /dev/null
+  printf '3\nteststore\ny\n' | "$ENGRAM" setup 2> /dev/null
 
   # Run again - should show skip for configured items
-  run bash -c "cd '$project_dir' && printf 'teststore\nn\n' | '$ENGRAM' setup"
+  run bash -c "cd '$project_dir' && printf '3\nteststore\nn\n' | '$ENGRAM' setup"
   [[ "$output" == *"skip (already configured)"* ]]
   [[ "$output" == *"skip (already ignored)"* ]]
 
@@ -61,7 +61,7 @@ load test_helper
   project_dir="$(mktemp -d)"
 
   cd "$project_dir"
-  printf 'teststore\ny\n' | "$ENGRAM" setup 2> /dev/null
+  printf '3\nteststore\ny\n' | "$ENGRAM" setup 2> /dev/null
 
   [ -f "$project_dir/.mcp.json" ]
   [ -f "$project_dir/.claude/CLAUDE.md" ]
@@ -90,10 +90,10 @@ load test_helper
 .mcp.json
 GITIGNORE
 
-  printf 'teststore\ny\n' | "$ENGRAM" setup 2> /dev/null
+  printf '3\nteststore\ny\n' | "$ENGRAM" setup 2> /dev/null
 
   # .gitignore should not have been modified (entries already ignored)
-  run bash -c "cd '$project_dir' && printf 'teststore\nn\n' | '$ENGRAM' setup"
+  run bash -c "cd '$project_dir' && printf '3\nteststore\nn\n' | '$ENGRAM' setup"
   [[ "$output" == *"skip (already ignored)"* ]]
 
   rm -rf "$project_dir"
@@ -106,7 +106,7 @@ GITIGNORE
   project_dir="$(mktemp -d)"
 
   cd "$project_dir"
-  printf 'NEW\nbrandnew\ny\n' | "$ENGRAM" setup 2> /dev/null
+  printf '3\nNEW\nbrandnew\ny\n' | "$ENGRAM" setup 2> /dev/null
 
   # Verify store was created
   run "$ENGRAM" list-stores
