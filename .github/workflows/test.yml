@@ -45,7 +45,7 @@ jobs:
       - name: Prime caches
         run: |
           export ENGRAM_DATA_DIR="$(mktemp -d)"
-          ./engram search global -- "warmup" 2>/dev/null || true
+          ./engram recall global -- "warmup" 2>/dev/null || true
           rm -rf "$ENGRAM_DATA_DIR"
 
       - name: Run tests
