@@ -549,7 +549,9 @@ defmodule App do
       create           <name>              Create a new store
       remove           <name>              Remove a store
       reindex          <name>              Regenerate all embeddings
-      find-duplicates  [-H] <name>         Find memories with similar content (TSV: score\\ta\\tb; -H adds header)
+      find-duplicates  [-H] <name>         Find memories with similar content (TSV: score\ta\tb; -H adds header)
+      remember         <name> --label...   Save a memory (--label, --content, --overwrite, --branch, --confidence)
+      forget           <name> <label>      Remove a memory by label
       show             <name> <slug>       Display a single memory by slug
       dump             <name> ...          Output all memories for one or more stores
       recall           <name> ... -- <q>   Semantic search across one or more stores
@@ -1269,6 +1271,11 @@ defmodule Setup do
     # Locate source material
     claude_md_src = Path.join(engram_dir, "example-claude.md")
     hooks_src = Path.join(engram_dir, "example-hooks.json")
+    pi_ext_src = Path.join(engram_dir, "pi-extension.ts")
+    pi_ext_dir = Path.join(cwd, ".pi")
+    pi_ext_target = Path.join([pi_ext_dir, "extensions", "engram.ts"])
+
+    has_pi_ext = File.exists?(pi_ext_src)
 
     for path <- [claude_md_src, hooks_src] do
       unless File.exists?(path) do
@@ -1278,6 +1285,11 @@ defmodule Setup do
 
     example_claude = File.read!(claude_md_src)
     example_hooks = File.read!(hooks_src) |> Jason.decode!()
+
+    # Prompt: what to set up
+    mode = prompt_setup_mode()
+    claude_mode = mode in [:claude, :both]
+    pi_mode = mode in [:pi, :both]
 
     # Prompt for store selection
     store_names = prompt_stores()
@@ -1289,26 +1301,40 @@ defmodule Setup do
     settings_path = Path.join(claude_dir, "settings.local.json")
     gitignore_path = Path.join(cwd, ".gitignore")
 
-    # Plan each step
-    mcp_action = plan_mcp(mcp_json_path)
-    claude_action = plan_claude_md(claude_md_path)
-    settings_action = plan_settings(claude_dir, settings_path)
+    # Plan each step (conditional on mode)
+    mcp_action = if claude_mode, do: plan_mcp(mcp_json_path), else: nil
+    claude_action = if claude_mode, do: plan_claude_md(claude_md_path), else: nil
+    settings_action = if claude_mode, do: plan_settings(claude_dir, settings_path), else: nil
     gitignore_action = plan_gitignore(gitignore_path)
+    pi_ext_action = if pi_mode and has_pi_ext, do: plan_pi_extension(pi_ext_target, pi_ext_src), else: nil
     store_action = plan_stores(store_names)
 
     mcp_stores_label = (store_names ++ ["global"]) |> Enum.join(", ")
 
+    # Build summary
+    mcp_summary = if claude_mode, do: "      .mcp.json:                    #{(mcp_action || %{summary: "skipped"}).summary}\n      .claude/CLAUDE.md:            #{(claude_action || %{summary: "skipped"}).summary}\n      .claude/settings.local.json:  #{(settings_action || %{summary: "skipped"}).summary}", else: "      .claude/*:                    skipped"
+
+    pi_summary = if pi_mode and has_pi_ext
+      do "      Pi extension:                 #{(pi_ext_action || %{summary: "skipped"}).summary}"
+      else "      Pi extension:                 (not selected)"
+    end
+
+    mode_label = case mode do
+      :claude -> "Claude Code"
+      :pi -> "pi"
+      :both -> "Claude Code + pi"
+    end
+
     # Print summary
     IO.puts(:standard_error, """
 
-    engram setup for '#{cwd}'
+    engram setup for '#{cwd}' (mode: #{mode_label})
 
       Stores (MCP):                 #{mcp_stores_label}
       Store changes:                #{store_action.summary}
-      .mcp.json:                    #{mcp_action.summary}
-      .claude/CLAUDE.md:            #{claude_action.summary}
-      .claude/settings.local.json:  #{settings_action.summary}
+#{mcp_summary}
       .gitignore:                   #{gitignore_action.summary}
+#{pi_summary}
     """)
 
     if gitignore_action.action != :skip do
@@ -1323,18 +1349,54 @@ defmodule Setup do
       line when is_binary(line) ->
         if String.trim(line) |> String.downcase() == "y" do
           execute_stores(store_action)
-          execute_mcp(mcp_json_path, mcp_action, engram_path, store_names)
-          ensure_claude_dir(claude_dir)
-          execute_claude_md(claude_md_path, claude_action, example_claude)
-          execute_settings(settings_path, settings_action, example_hooks)
+
+          if claude_mode do
+            execute_mcp(mcp_json_path, mcp_action, engram_path, store_names)
+            ensure_claude_dir(claude_dir)
+            execute_claude_md(claude_md_path, claude_action, example_claude)
+            execute_settings(settings_path, settings_action, example_hooks)
+          end
+
+          if pi_mode and has_pi_ext do
+            execute_pi_extension(pi_ext_target, pi_ext_src)
+          end
+
           execute_gitignore(gitignore_path, gitignore_action)
-          App.info("Done. Restart Claude Code to pick up the new configuration.")
+
+          done_msg = if mode == :both, do: "Done. Restart Claude Code or pi to pick up the new configuration.",
+            else: "Done. Restart #{mode_label} to pick up the new configuration."
+          App.info(done_msg)
         else
           App.info("Cancelled.")
         end
 
       _ ->
         App.info("Cancelled.")
+    end
+  end
+
+  #-----------------------------------------------------------------------------
+  # Setup mode prompt
+  #-----------------------------------------------------------------------------
+
+  defp prompt_setup_mode do
+    IO.puts(:standard_error, """
+What do you want to set up?
+  [1] Claude Code only
+  [2] pi only
+  [3] Both Claude Code and pi (default)
+""")
+    IO.write(:standard_error, "> ")
+
+    case IO.read(:stdio, :line) do
+      line when is_binary(line) ->
+        case String.trim(line) do
+          "1" -> :claude
+          "2" -> :pi
+          _ -> :both
+        end
+      _ ->
+        :both
     end
   end
 
@@ -1504,7 +1566,7 @@ defmodule Setup do
     end
   end
 
-  @gitignore_entries [".mcp.json", ".claude/"]
+  @gitignore_entries [".mcp.json", ".claude/", ".pi/"]
 
   defp plan_gitignore(path) do
     if not in_git_repo?() do
@@ -1517,6 +1579,27 @@ defmodule Setup do
         {true, entries} -> %{summary: "append #{Enum.join(entries, " and ")}", action: :append, entries: entries}
         {false, _} -> %{summary: "create", action: :create}
       end
+    end
+  end
+
+  defp plan_pi_extension(target, source) do
+    cond do
+      not File.exists?(source) ->
+        %{summary: "source not found", action: :skip}
+
+      File.exists?(target) ->
+        real_target = case File.read_link(target) do
+          {:ok, link} -> link
+          _ -> :not_link
+        end
+        if real_target == "../../pi-extension.ts" do
+          %{summary: "already linked", action: :skip}
+        else
+          %{summary: "update symlink", action: :link}
+        end
+
+      true ->
+        %{summary: "create symlink", action: :link}
     end
   end
 
@@ -1589,6 +1672,24 @@ defmodule Setup do
 
   defp execute_claude_md(path, %{action: :append}, example) do
     File.write!(path, File.read!(path) <> "\n\n" <> example)
+  end
+
+  defp execute_pi_extension(target, source) do
+    dir = Path.dirname(target)
+    File.mkdir_p!(dir)
+
+    # Remove existing target if present
+    if File.exists?(target) do
+      File.rm!(target)
+    end
+
+    # Create relative symlink from .pi/extensions/engram.ts -> ../../pi-extension.ts
+    File.ln_s!(relative_symlink_target(target, source), target)
+  end
+
+  defp relative_symlink_target(target, source) do
+    target_dir = Path.dirname(target)
+    source |> Path.absname() |> Path.relative_to(target_dir)
   end
 
   defp execute_settings(_path, %{action: :skip}, _hooks), do: :ok
@@ -1885,6 +1986,21 @@ case argv do
         App.fatal(reason)
     end
 
+  ["forget", store, label] ->
+    with :ok <- Store.open_db(),
+         :ok <- Store.validate_stores([store]) do
+      case Store.forget(store, label) do
+        :ok ->
+          IO.puts("[forgotten] #{store} :: #{label}")
+
+        {:error, reason} ->
+          App.error(reason)
+      end
+    else
+      {:error, reason} ->
+        App.fatal(reason)
+    end
+
   ["show", store, slug] ->
     with :ok <- Store.open_db(),
          :ok <- Store.validate_stores([store]) do
@@ -1944,6 +2060,58 @@ case argv do
     else
       {:error, reason} ->
         App.fatal(reason)
+    end
+
+  ["remember", store | rest] ->
+    {flags, _, invalid} =
+      OptionParser.parse(rest,
+        switches: [
+          label: :string,
+          content: :string,
+          overwrite: :boolean,
+          branch: :string,
+          confidence: :integer
+        ]
+      )
+
+    if invalid != [] do
+      bad = Enum.map(invalid, fn {k, _} -> k end)
+      App.fatal("Unrecognized flags: #{Enum.join(bad, ", ")}")
+    end
+
+    label = flags[:label]
+    content = flags[:content]
+
+    cond do
+      is_nil(label) ->
+        App.fatal("Usage: engram remember <store> --label <label> --content <content>")
+
+      is_nil(content) ->
+        App.fatal("Usage: engram remember <store> --label <label> --content <content>")
+
+      true ->
+        with :ok <- Store.open_db(),
+             :ok <- Store.validate_stores([store]) do
+          Nx.global_default_backend(EXLA.Backend)
+          Embeddings.start()
+
+          opts = [
+            overwrite: flags[:overwrite] || false,
+            branch: flags[:branch],
+            confidence: flags[:confidence]
+          ]
+
+          case Store.write(store, label, content, opts) do
+            :ok ->
+              IO.puts("[saved] #{store} :: #{label}")
+
+            {:error, reason} ->
+              App.error(reason)
+          end
+        else
+          {:error, reason} ->
+            App.fatal(reason)
+        end
     end
 
   ["recall" | rest] when rest != [] ->

@@ -3,3 +3,6 @@ scratch/
 
 .claude/
 .mcp.json
+
+# pi agent extension (symlinked to pi-extension.ts at repo root)
+.pi/

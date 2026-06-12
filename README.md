@@ -26,6 +26,8 @@ Commands:
   remove           <name>              Remove a store
   reindex          <name>              Regenerate all embeddings
   find-duplicates  [-H] <name>         Find memories with similar content
+  remember         <name> --label...   Save a memory (--label, --content, --overwrite, --branch, --confidence)
+  forget           <name> <label>      Remove a memory by label
   show             <name> <slug>       Display a single memory by slug
   dump             <name> ...          Output all memories for one or more stores
   recall           <name> ... -- <q>   Semantic search across one or more stores
@@ -63,13 +65,17 @@ cd /path/to/your/project
 engram setup
 ```
 
-`setup` writes to four locations:
-- `.mcp.json` - MCP server config
+`setup` prompts you for:
+- **Setup mode**: Claude Code only, pi only, or both
+- **Store selection**: choose existing stores or create new ones
+
+Based on your choices, `setup` writes to:
+- `.mcp.json` - MCP server config (Claude Code)
 - `.claude/CLAUDE.md` - prompt instructions for Claude Code
 - `.claude/settings.local.json` - session hooks for automatic recall/write
-- `.gitignore` - adds `.mcp.json` and `.claude/` to keep config out of version control
+- `.pi/extensions/engram.ts` - pi extension for native integration
+- `.gitignore` - adds config paths to keep them out of version control
 
-Setup prompts you to select from existing stores or create new ones.
 A `global` store is always included automatically.
 
 Before making changes, `setup` shows a summary of what it will do and prompts for confirmation.
