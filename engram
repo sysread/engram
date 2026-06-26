@@ -527,6 +527,57 @@ defmodule ShowMemory do
   end
 end
 
+defmodule MoveMemory do
+  @behaviour McpTool
+
+  @impl true
+  def spec() do
+    %{
+      name: "move",
+      description: "Moves a memory from one store to another. The move preserves the memory's " <>
+        "embedding (it keeps matching in recall, no reindex needed) and its timestamps. " <>
+        "Use this to refile a memory that was saved to the wrong store. " <>
+        "Refuses to overwrite a memory that already exists in the destination.",
+      inputSchema: %{
+        type: "object",
+        required: ["label", "to"],
+        properties: %{
+          label: %{
+            type: "string",
+            description: "The exact label of the memory to move"
+          },
+          to: %{
+            type: "string",
+            description: "Destination store to move the memory into"
+          },
+          from: %{
+            type: "string",
+            description: "Source store to move the memory out of (defaults to the primary project store)"
+          }
+        }
+      }
+    }
+  end
+
+  @impl true
+  def call(%{"label" => label, "to" => dest} = args) do
+    src = Map.get(args, "from", State.default_store())
+
+    with :ok <- State.authorize_store(src),
+         :ok <- State.authorize_store(dest) do
+      case Store.move(src, dest, [label]) do
+        {:ok, _} -> {:ok, "[moved] #{src} -> #{dest} :: #{label}"}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  def call(_) do
+    {:error, "Missing or invalid arguments. Required: label (string), to (string, destination store). " <>
+      "Optional: from (source store, defaults to the primary store)."}
+  end
+end
+
 #-------------------------------------------------------------------------------
 # Common app bits
 #-------------------------------------------------------------------------------
@@ -552,6 +603,7 @@ defmodule App do
       find-duplicates  [-H] <name>         Find memories with similar content (TSV: score\ta\tb; -H adds header)
       remember         <name> --label...   Save a memory (--label, --content, --overwrite, --branch, --confidence)
       forget           <name> <label>      Remove a memory by label
+      move             <src> <dst> <slug>...  Move memories to another store (keeps embedding)
       show             <name> <slug>       Display a single memory by slug
       dump             <name> ...          Output all memories for one or more stores
       recall           <name> ... -- <q>   Semantic search across one or more stores
@@ -1039,6 +1091,73 @@ defmodule Store do
       :ok
     else
       {:error, "[not found] #{store} :: #{label}"}
+    end
+  end
+
+  # Moves one or more memories from one store to another. Identifiers may be
+  # given as slugs (as printed by recall) or as labels; both are slugified, so
+  # the two are interchangeable. A move is a pure store-retag: the embedding is
+  # content-derived, so a moved memory keeps matching in recall with no reindex,
+  # and timestamps are left untouched so the move does not reset staleness.
+  # Refuses to overwrite -- a slug already present in the destination blocks the
+  # move, since the (slug, store) primary key would collide. Everything is
+  # validated before anything is written. Returns {:ok, slugs} with the moved
+  # slugs, or {:error, reason}.
+  def move(src, dest, idents) do
+    slugs = idents |> Enum.map(&slugify/1) |> Enum.uniq()
+
+    cond do
+      src == dest ->
+        {:error, "Source and destination are the same store: '#{src}'."}
+
+      not store_exists?(src) ->
+        {:error, "Store '#{src}' does not exist."}
+
+      not store_exists?(dest) ->
+        {:error, "Store '#{dest}' does not exist."}
+
+      true ->
+        missing = Enum.reject(slugs, &entry_exists?(src, &1))
+        collisions = Enum.filter(slugs, &entry_exists?(dest, &1))
+
+        cond do
+          missing != [] ->
+            {:error, "Not found in '#{src}': #{Enum.join(missing, ", ")}"}
+
+          collisions != [] ->
+            {:error, "Already present in '#{dest}' (refusing to overwrite): #{Enum.join(collisions, ", ")}"}
+
+          true ->
+            move_entries(src, dest, slugs)
+            {:ok, slugs}
+        end
+    end
+  end
+
+  # Retags the store column for each slug, wrapped in a single transaction so a
+  # partial batch never commits. Only the store changes; embedding, model,
+  # branch, confidence, and timestamps are preserved.
+  defp move_entries(src, dest, slugs) do
+    db = State.db()
+    :ok = Exqlite.Sqlite3.execute(db, "BEGIN")
+
+    try do
+      {:ok, stmt} = Exqlite.Sqlite3.prepare(db,
+        "UPDATE entries SET store = ?1 WHERE store = ?2 AND slug = ?3"
+      )
+
+      Enum.each(slugs, fn slug ->
+        :ok = Exqlite.Sqlite3.bind(stmt, [dest, src, slug])
+        :done = Exqlite.Sqlite3.step(db, stmt)
+      end)
+
+      :ok = Exqlite.Sqlite3.release(db, stmt)
+      :ok = Exqlite.Sqlite3.execute(db, "COMMIT")
+      :ok
+    rescue
+      e ->
+        Exqlite.Sqlite3.execute(db, "ROLLBACK")
+        reraise e, __STACKTRACE__
     end
   end
 
@@ -1992,6 +2111,23 @@ case argv do
       case Store.forget(store, label) do
         :ok ->
           IO.puts("[forgotten] #{store} :: #{label}")
+
+        {:error, reason} ->
+          App.error(reason)
+      end
+    else
+      {:error, reason} ->
+        App.fatal(reason)
+    end
+
+  ["move", src, dest | slugs] when slugs != [] ->
+    with :ok <- Store.open_db(),
+         :ok <- Store.validate_stores([src, dest]) do
+      case Store.move(src, dest, slugs) do
+        {:ok, moved} ->
+          Enum.each(moved, fn slug ->
+            IO.puts("[moved] #{src} -> #{dest} :: #{slug}")
+          end)
 
         {:error, reason} ->
           App.error(reason)

@@ -56,8 +56,8 @@ load test_helper
   } | mcp_call teststore | mcp_response_for 2)"
 
   names="$(jq -r '.result.tools[].name' <<< "$resp" | sort | tr '\n' ' ')"
-  # All seven tools must be present. Order is sorted for stability.
-  [ "$names" = "find-duplicates forget list list-stores recall remember show " ]
+  # All eight tools must be present. Order is sorted for stability.
+  [ "$names" = "find-duplicates forget list list-stores move recall remember show " ]
 }
 
 @test "mcp tools/call with unknown tool name returns JSON-RPC error" {
@@ -180,4 +180,71 @@ load test_helper
   # other-branch recall sees only the unscoped one
   [[ "$text_other" == *"event-sourced ledger"* ]]
   [[ "$text_other" != *"idempotency keys"* ]]
+}
+
+@test "mcp move relocates a memory and it still matches recall from the destination" {
+  # The core guarantee: move is a store-retag, not a delete+recreate, so the
+  # embedding survives and the memory keeps matching recall -- now tagged to the
+  # destination store, not the source.
+  "$ENGRAM" create src_store 2>/dev/null
+  "$ENGRAM" create dst_store 2>/dev/null
+
+  remember="$(mcp_tool_call 2 remember '{"label":"movable","content":"The user prefers Postgres for transactional workloads.","store":"src_store"}')"
+  move="$(mcp_tool_call 3 move '{"label":"movable","from":"src_store","to":"dst_store"}')"
+  recall="$(mcp_tool_call 4 recall '{"query":"which database does the user like?"}')"
+
+  out="$({
+    mcp_init 1
+    echo "$remember"
+    echo "$move"
+    echo "$recall"
+  } | mcp_call src_store dst_store)"
+
+  move_text="$(echo "$out" | mcp_response_for 3 | jq -r '.result.content[0].text')"
+  recall_text="$(echo "$out" | mcp_response_for 4 | jq -r '.result.content[0].text')"
+
+  [[ "$move_text" == *"[moved]"* ]]
+  [[ "$move_text" == *"dst_store"* ]]
+  # Embedding preserved (still matches) and re-scoped to the destination store.
+  [[ "$recall_text" == *"Postgres"* ]]
+  [[ "$recall_text" == *"store:dst_store"* ]]
+  [[ "$recall_text" != *"store:src_store"* ]]
+}
+
+@test "mcp move refuses to overwrite an existing label in the destination" {
+  "$ENGRAM" create src_store 2>/dev/null
+  "$ENGRAM" create dst_store 2>/dev/null
+
+  seed_src="$(mcp_tool_call 2 remember '{"label":"dup","content":"source copy","store":"src_store"}')"
+  seed_dst="$(mcp_tool_call 3 remember '{"label":"dup","content":"destination copy","store":"dst_store"}')"
+  move="$(mcp_tool_call 4 move '{"label":"dup","from":"src_store","to":"dst_store"}')"
+
+  resp="$({
+    mcp_init 1
+    echo "$seed_src"
+    echo "$seed_dst"
+    echo "$move"
+  } | mcp_call src_store dst_store | mcp_response_for 4)"
+
+  # Collision is a tool-level error (isError envelope), not a JSON-RPC error.
+  [ "$(jq '.result.isError' <<< "$resp")" = "true" ]
+  [[ "$(jq -r '.result.content[0].text' <<< "$resp")" == *"refusing to overwrite"* ]]
+}
+
+@test "mcp move into a store outside the session is refused" {
+  # Authorization guard: a session can only move among the stores it serves.
+  "$ENGRAM" create src_store 2>/dev/null
+  "$ENGRAM" create other_store 2>/dev/null
+
+  remember="$(mcp_tool_call 2 remember '{"label":"guarded","content":"body","store":"src_store"}')"
+  move="$(mcp_tool_call 3 move '{"label":"guarded","from":"src_store","to":"other_store"}')"
+
+  resp="$({
+    mcp_init 1
+    echo "$remember"
+    echo "$move"
+  } | mcp_call src_store | mcp_response_for 3)"
+
+  [ "$(jq '.result.isError' <<< "$resp")" = "true" ]
+  [[ "$(jq -r '.result.content[0].text' <<< "$resp")" == *"not available in this session"* ]]
 }

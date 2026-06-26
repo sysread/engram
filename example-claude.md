@@ -2,7 +2,7 @@
 
 `engram` is a semantic memory store exposed via MCP.
 Use it to persist knowledge across sessions so future instances of yourself can build on what you've already learned.
-Tools are prefixed in Claude Code: `mcp__engram__remember`, `mcp__engram__recall`, `mcp__engram__list`, `mcp__engram__show`, `mcp__engram__forget`, `mcp__engram__find-duplicates`, `mcp__engram__list-stores`.
+Tools are prefixed in Claude Code: `mcp__engram__remember`, `mcp__engram__recall`, `mcp__engram__list`, `mcp__engram__show`, `mcp__engram__forget`, `mcp__engram__move`, `mcp__engram__find-duplicates`, `mcp__engram__list-stores`.
 Bare names used below for readability.
 
 ## Stores

@@ -28,6 +28,7 @@ Commands:
   find-duplicates  [-H] <name>         Find memories with similar content
   remember         <name> --label...   Save a memory (--label, --content, --overwrite, --branch, --confidence)
   forget           <name> <label>      Remove a memory by label
+  move             <src> <dst> <slug>...  Move memories to another store (keeps embedding)
   show             <name> <slug>       Display a single memory by slug
   dump             <name> ...          Output all memories for one or more stores
   recall           <name> ... -- <q>   Semantic search across one or more stores

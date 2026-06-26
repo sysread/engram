@@ -48,3 +48,42 @@ load test_helper
   [ ! -s "$stdout_file" ]
   grep -q "No memories" "$stderr_file"
 }
+
+@test "move relocates an entry to another store (CLI)" {
+  "$ENGRAM" create src_store 2> /dev/null
+  "$ENGRAM" create dst_store 2> /dev/null
+
+  # Seed a memory in src_store via MCP, then move it by slug via the CLI.
+  remember="$(mcp_tool_call 2 remember '{"label":"portable note","content":"some body","store":"src_store"}')"
+  { mcp_init 1; echo "$remember"; } | mcp_call src_store dst_store > /dev/null
+
+  run "$ENGRAM" move src_store dst_store portable-note
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"[moved] src_store -> dst_store :: portable-note"* ]]
+
+  # Gone from source, present in destination.
+  src_list="$("$ENGRAM" list src_store 2> /dev/null)"
+  dst_list="$("$ENGRAM" list dst_store 2> /dev/null)"
+  [[ "$src_list" != *"portable note"* ]]
+  [[ "$dst_list" == *"portable note"* ]]
+}
+
+@test "move refuses to overwrite a colliding slug in the destination (CLI)" {
+  "$ENGRAM" create src_store 2> /dev/null
+  "$ENGRAM" create dst_store 2> /dev/null
+
+  seed_src="$(mcp_tool_call 2 remember '{"label":"dup","content":"src","store":"src_store"}')"
+  seed_dst="$(mcp_tool_call 3 remember '{"label":"dup","content":"dst","store":"dst_store"}')"
+  { mcp_init 1; echo "$seed_src"; echo "$seed_dst"; } | mcp_call src_store dst_store > /dev/null
+
+  run "$ENGRAM" move src_store dst_store dup
+  [[ "$output" == *"refusing to overwrite"* ]]
+}
+
+@test "move of a missing slug reports not found (CLI)" {
+  "$ENGRAM" create src_store 2> /dev/null
+  "$ENGRAM" create dst_store 2> /dev/null
+
+  run "$ENGRAM" move src_store dst_store no-such-slug
+  [[ "$output" == *"Not found in 'src_store'"* ]]
+}

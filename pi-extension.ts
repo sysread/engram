@@ -72,6 +72,7 @@ You have persistent memory via engram. Tools:
 - \`engram_list\` - List memories
 - \`engram_show\` label - Show a memory
 - \`engram_forget\` label - Delete a memory
+- \`engram_move\` label, to - Move a memory to another store
 - \`engram_find_duplicates\` - Find near-duplicates
 - \`engram_list_stores\` - List stores
 
@@ -217,6 +218,23 @@ After responding, check: did you learn new project knowledge, user preferences, 
     parameters: Type.Object({}),
     async execute(_id, _params, signal) {
       const output = await runEngram(["list-stores"], signal);
+      return { content: [{ type: "text", text: output }], details: {} };
+    },
+  });
+
+  // 8. move
+  pi.registerTool({
+    name: "engram_move",
+    label: "engram: Move",
+    description: "Move a memory from one store to another, preserving its embedding and timestamps",
+    parameters: Type.Object({
+      label: Type.String({ description: "Label of the memory to move" }),
+      to: Type.String({ description: "Destination store" }),
+      from: Type.Optional(Type.String({ description: "Source store (default: first active)" })),
+    }),
+    async execute(_id, params, signal) {
+      const from = params.from || stores[0] || "global";
+      const output = await runEngram(["move", from, params.to, params.label], signal);
       return { content: [{ type: "text", text: output }], details: {} };
     },
   });
