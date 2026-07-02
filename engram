@@ -1001,7 +1001,7 @@ defmodule Store do
          {:ok, rows} <- fetch_all_embeddings(stores, branch) do
       rows
       |> Enum.map(fn [slug, content, embedding_blob, store, entry_branch, confidence] ->
-        embedding = :erlang.binary_to_term(embedding_blob)
+        embedding = deserialize_embedding(embedding_blob)
         score = Embeddings.tensor_similarity(query_embedding, embedding)
         {score, %Entry{slug: slug, content: content, store: store, branch: entry_branch, confidence: confidence}}
       end)
@@ -1063,7 +1063,7 @@ defmodule Store do
     result =
       case Exqlite.Sqlite3.step(db, stmt) do
         {:row, [content, blob]} when not is_nil(blob) ->
-          {:ok, content, :erlang.binary_to_term(blob)}
+          {:ok, content, deserialize_embedding(blob)}
 
         _ ->
           :not_found
@@ -1073,9 +1073,22 @@ defmodule Store do
     result
   end
 
+  # Embeddings are stored as raw IEEE 754 f32 bytes via Nx.to_binary/1.
+  # Older entries may still use Erlang binary terms (starting with byte 131);
+  # the deserializer detects and handles both formats transparently.
+  defp serialize_embedding(embedding), do: Nx.to_binary(embedding)
+
+  defp deserialize_embedding(<<131, _::binary>> = blob) do
+    :erlang.binary_to_term(blob)
+  end
+
+  defp deserialize_embedding(blob) do
+    Nx.from_binary(blob, {:f, 32})
+  end
+
   defp upsert_entry(store, slug, label, content, embedding, branch, confidence) do
     db = State.db()
-    blob = {:blob, :erlang.term_to_binary(embedding)}
+    blob = {:blob, serialize_embedding(embedding)}
     now = DateTime.utc_now() |> DateTime.to_iso8601()
 
     {:ok, stmt} = Exqlite.Sqlite3.prepare(db, """
@@ -1221,7 +1234,7 @@ defmodule Store do
     Enum.each(rows, fn [slug, content] ->
       App.info("Reindexing '#{slug}'...")
       {:ok, embedding} = Embeddings.embed(content)
-      blob = {:blob, :erlang.term_to_binary(embedding)}
+      blob = {:blob, serialize_embedding(embedding)}
       :ok = Exqlite.Sqlite3.bind(stmt, [blob, model, slug, store])
       :done = Exqlite.Sqlite3.step(db, stmt)
     end)
@@ -1310,7 +1323,7 @@ defmodule Store do
     with {:ok, rows} <- fetch_entries(store, "slug, label, embedding") do
       entries =
         Enum.map(rows, fn [slug, label, blob] ->
-          %{slug: slug, label: label, embedding: :erlang.binary_to_term(blob)}
+          %{slug: slug, label: label, embedding: deserialize_embedding(blob)}
         end)
       pairs =
         for a <- entries, b <- entries, a.slug < b.slug do
