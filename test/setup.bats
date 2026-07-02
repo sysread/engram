@@ -118,7 +118,7 @@ GITIGNORE
   rm -rf "$project_dir"
 }
 
-@test "setup creates opencode.json and .opencode/instructions/engram.md" {
+@test "setup creates opencode.json, .opencode/instructions/, and plugin" {
   "$ENGRAM" create teststore 2> /dev/null
   "$ENGRAM" create global 2> /dev/null
 
@@ -132,6 +132,7 @@ GITIGNORE
 
   [ -f "$project_dir/opencode.json" ]
   [ -f "$project_dir/.opencode/instructions/engram.md" ]
+  [ -f "$project_dir/.opencode/plugins/engram.ts" ]
   [ -f "$project_dir/.gitignore" ]
 
   # opencode.json contains engram MCP entry
@@ -143,6 +144,9 @@ GITIGNORE
 
   # Instructions file contains engram content
   [[ "$(cat "$project_dir/.opencode/instructions/engram.md")" == *"engram_remember"* ]]
+
+  # Plugin file is the session-reminder module
+  [[ "$(cat "$project_dir/.opencode/plugins/engram.ts")" == *"session.created"* ]]
 
   # .gitignore contains opencode entries
   [[ "$(cat "$project_dir/.gitignore")" == *"opencode.json"* ]]
@@ -166,6 +170,7 @@ GITIGNORE
   # Run again - should show skip for configured items
   run bash -c "cd '$project_dir' && printf '3\nteststore\nn\n' | '$ENGRAM' setup"
   [[ "$output" == *"skip (already configured)"* ]]
+  [[ "$output" == *"skip (already deployed)"* ]]
 
   rm -rf "$project_dir"
 }

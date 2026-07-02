@@ -1394,10 +1394,11 @@ defmodule Setup do
     pi_ext_dir = Path.join(cwd, ".pi")
     pi_ext_target = Path.join([pi_ext_dir, "extensions", "engram.ts"])
     opencode_md_src = Path.join(engram_dir, "example-opencode.md")
+    opencode_plugin_src = Path.join(engram_dir, "engram-plugin.ts")
 
     has_pi_ext = File.exists?(pi_ext_src)
 
-    for path <- [claude_md_src, hooks_src, opencode_md_src] do
+    for path <- [claude_md_src, hooks_src, opencode_md_src, opencode_plugin_src] do
       unless File.exists?(path) do
         App.fatal("Missing #{path} - is the engram installation intact?")
       end
@@ -1406,6 +1407,7 @@ defmodule Setup do
     example_claude = File.read!(claude_md_src)
     example_hooks = File.read!(hooks_src) |> Jason.decode!()
     example_opencode = File.read!(opencode_md_src)
+    plugin_src = opencode_plugin_src
 
     # Prompt: what to set up
     mode = prompt_setup_mode()
@@ -1425,6 +1427,8 @@ defmodule Setup do
     opencode_json_path = Path.join(cwd, "opencode.json")
     opencode_instructions_dir = Path.join(cwd, ".opencode/instructions")
     opencode_instructions_path = Path.join(opencode_instructions_dir, "engram.md")
+    opencode_plugin_dir = Path.join(cwd, ".opencode/plugins")
+    opencode_plugin_path = Path.join(opencode_plugin_dir, "engram.ts")
 
     # Plan each step (conditional on mode)
     mcp_action = if claude_mode, do: plan_mcp(mcp_json_path), else: nil
@@ -1434,12 +1438,13 @@ defmodule Setup do
     pi_ext_action = if pi_mode and has_pi_ext, do: plan_pi_extension(pi_ext_target, pi_ext_src), else: nil
     opencode_json_action = if opencode_mode, do: plan_opencode_json(opencode_json_path), else: nil
     opencode_instructions_action = if opencode_mode, do: plan_opencode_instructions(opencode_instructions_path), else: nil
+    opencode_plugin_action = if opencode_mode, do: plan_opencode_plugin(opencode_plugin_path), else: nil
     store_action = plan_stores(store_names)
 
     mcp_stores_label = (store_names ++ ["global"]) |> Enum.join(", ")
 
     # Build summary
-    oc_json_summary = if opencode_mode, do: "      opencode.json:                #{(opencode_json_action || %{summary: "skipped"}).summary}\n      .opencode/instructions/       #{(opencode_instructions_action || %{summary: "skipped"}).summary}", else: "      opencode.*:                   skipped"
+    oc_json_summary = if opencode_mode, do: "      opencode.json:                #{(opencode_json_action || %{summary: "skipped"}).summary}\n      .opencode/instructions/       #{(opencode_instructions_action || %{summary: "skipped"}).summary}\n      .opencode/plugins/            #{(opencode_plugin_action || %{summary: "skipped"}).summary}", else: "      opencode.*:                   skipped"
 
     mcp_summary = if claude_mode, do: "      .mcp.json:                    #{(mcp_action || %{summary: "skipped"}).summary}\n      .claude/CLAUDE.md:            #{(claude_action || %{summary: "skipped"}).summary}\n      .claude/settings.local.json:  #{(settings_action || %{summary: "skipped"}).summary}", else: "      .claude/*:                    skipped"
 
@@ -1494,6 +1499,7 @@ defmodule Setup do
           if opencode_mode do
             execute_opencode_json(opencode_json_path, opencode_json_action, engram_path, store_names)
             execute_opencode_instructions(opencode_instructions_path, opencode_instructions_action, example_opencode)
+            execute_opencode_plugin(opencode_plugin_path, opencode_plugin_action, plugin_src)
           end
 
           execute_gitignore(gitignore_path, gitignore_action)
@@ -1772,6 +1778,15 @@ Which tool do you want to set up?
     end
   end
 
+  # Plans .opencode/plugins/engram.ts: copy the session-reminder plugin.
+  defp plan_opencode_plugin(path) do
+    if File.exists?(path) do
+      %{summary: "skip (already deployed)", action: :skip}
+    else
+      %{summary: "create", action: :create}
+    end
+  end
+
   defp in_git_repo? do
     match?({_, 0}, System.cmd("git", ["rev-parse", "--git-dir"], stderr_to_stdout: true))
   end
@@ -1902,6 +1917,14 @@ Which tool do you want to set up?
 
   defp execute_opencode_instructions(path, %{action: :update}, example) do
     File.write!(path, example)
+  end
+
+  defp execute_opencode_plugin(_path, %{action: :skip}, _source), do: :ok
+
+  defp execute_opencode_plugin(path, %{action: :create}, source) do
+    dir = Path.dirname(path)
+    File.mkdir_p!(dir)
+    File.cp!(source, path)
   end
 
   defp execute_settings(_path, %{action: :skip}, _hooks), do: :ok
