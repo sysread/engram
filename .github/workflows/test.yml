@@ -9,6 +9,7 @@ on:
 env:
   MIX_INSTALL_DIR: ~/.cache/mix/installs
   BUMBLEBEE_CACHE_DIR: ~/.cache/bumblebee
+  XLA_CACHE_DIR: ~/.cache/exla
   ENGRAM_MODEL: sentence-transformers/paraphrase-MiniLM-L3-v2
 
 jobs:
@@ -40,7 +41,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.BUMBLEBEE_CACHE_DIR }}
-          key: bumblebee-${{ runner.os }}-${{ env.ENGRAM_MODEL }}
+          key: bumblebee-${{ runner.os }}-${{ replace(env.ENGRAM_MODEL, '/', '-') }}
+
+      - name: Cache XLA binary archive
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.XLA_CACHE_DIR }}
+          key: exla-${{ runner.os }}-${{ replace(env.ENGRAM_MODEL, '/', '-') }}
 
       - name: Prime caches
         run: |
