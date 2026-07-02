@@ -26,8 +26,8 @@ run = """
 
 [tasks.test]
 description = "Run bats tests"
-depends = ["check-deps"]
-run = "bats --jobs 4 test/"
+depends = ["check-deps", "warm-cache"]
+run = "bats -T --jobs 4 test/"
 
 [tasks.warm-cache]
 description = "Download embedding model and elixir deps"
