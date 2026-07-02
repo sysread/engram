@@ -6,3 +6,6 @@ scratch/
 
 # pi agent extension (symlinked to pi-extension.ts at repo root)
 .pi/
+
+opencode.json
+.opencode/

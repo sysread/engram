@@ -1393,10 +1393,11 @@ defmodule Setup do
     pi_ext_src = Path.join(engram_dir, "pi-extension.ts")
     pi_ext_dir = Path.join(cwd, ".pi")
     pi_ext_target = Path.join([pi_ext_dir, "extensions", "engram.ts"])
+    opencode_md_src = Path.join(engram_dir, "example-opencode.md")
 
     has_pi_ext = File.exists?(pi_ext_src)
 
-    for path <- [claude_md_src, hooks_src] do
+    for path <- [claude_md_src, hooks_src, opencode_md_src] do
       unless File.exists?(path) do
         App.fatal("Missing #{path} - is the engram installation intact?")
       end
@@ -1404,11 +1405,13 @@ defmodule Setup do
 
     example_claude = File.read!(claude_md_src)
     example_hooks = File.read!(hooks_src) |> Jason.decode!()
+    example_opencode = File.read!(opencode_md_src)
 
     # Prompt: what to set up
     mode = prompt_setup_mode()
-    claude_mode = mode in [:claude, :both]
-    pi_mode = mode in [:pi, :both]
+    claude_mode = mode == :claude
+    pi_mode = mode == :pi
+    opencode_mode = mode == :opencode
 
     # Prompt for store selection
     store_names = prompt_stores()
@@ -1419,6 +1422,9 @@ defmodule Setup do
     claude_md_path = Path.join(claude_dir, "CLAUDE.md")
     settings_path = Path.join(claude_dir, "settings.local.json")
     gitignore_path = Path.join(cwd, ".gitignore")
+    opencode_json_path = Path.join(cwd, "opencode.json")
+    opencode_instructions_dir = Path.join(cwd, ".opencode/instructions")
+    opencode_instructions_path = Path.join(opencode_instructions_dir, "engram.md")
 
     # Plan each step (conditional on mode)
     mcp_action = if claude_mode, do: plan_mcp(mcp_json_path), else: nil
@@ -1426,11 +1432,15 @@ defmodule Setup do
     settings_action = if claude_mode, do: plan_settings(claude_dir, settings_path), else: nil
     gitignore_action = plan_gitignore(gitignore_path)
     pi_ext_action = if pi_mode and has_pi_ext, do: plan_pi_extension(pi_ext_target, pi_ext_src), else: nil
+    opencode_json_action = if opencode_mode, do: plan_opencode_json(opencode_json_path), else: nil
+    opencode_instructions_action = if opencode_mode, do: plan_opencode_instructions(opencode_instructions_path), else: nil
     store_action = plan_stores(store_names)
 
     mcp_stores_label = (store_names ++ ["global"]) |> Enum.join(", ")
 
     # Build summary
+    oc_json_summary = if opencode_mode, do: "      opencode.json:                #{(opencode_json_action || %{summary: "skipped"}).summary}\n      .opencode/instructions/       #{(opencode_instructions_action || %{summary: "skipped"}).summary}", else: "      opencode.*:                   skipped"
+
     mcp_summary = if claude_mode, do: "      .mcp.json:                    #{(mcp_action || %{summary: "skipped"}).summary}\n      .claude/CLAUDE.md:            #{(claude_action || %{summary: "skipped"}).summary}\n      .claude/settings.local.json:  #{(settings_action || %{summary: "skipped"}).summary}", else: "      .claude/*:                    skipped"
 
     pi_summary = if pi_mode and has_pi_ext
@@ -1441,7 +1451,7 @@ defmodule Setup do
     mode_label = case mode do
       :claude -> "Claude Code"
       :pi -> "pi"
-      :both -> "Claude Code + pi"
+      :opencode -> "OpenCode"
     end
 
     # Print summary
@@ -1451,13 +1461,14 @@ defmodule Setup do
 
       Stores (MCP):                 #{mcp_stores_label}
       Store changes:                #{store_action.summary}
-#{mcp_summary}
+    #{oc_json_summary}
+    #{mcp_summary}
       .gitignore:                   #{gitignore_action.summary}
-#{pi_summary}
+    #{pi_summary}
     """)
 
     if gitignore_action.action != :skip do
-      IO.puts(:standard_error, "  Note: .mcp.json and .claude/ will be gitignored.")
+      IO.puts(:standard_error, "  Note: .mcp.json, opencode.json, .claude/, and .opencode/ will be gitignored.")
       IO.puts(:standard_error, "  Remove from .gitignore to share with your team.\n")
     end
 
@@ -1480,11 +1491,14 @@ defmodule Setup do
             execute_pi_extension(pi_ext_target, pi_ext_src)
           end
 
+          if opencode_mode do
+            execute_opencode_json(opencode_json_path, opencode_json_action, engram_path, store_names)
+            execute_opencode_instructions(opencode_instructions_path, opencode_instructions_action, example_opencode)
+          end
+
           execute_gitignore(gitignore_path, gitignore_action)
 
-          done_msg = if mode == :both, do: "Done. Restart Claude Code or pi to pick up the new configuration.",
-            else: "Done. Restart #{mode_label} to pick up the new configuration."
-          App.info(done_msg)
+          App.info("Done. Restart #{mode_label} to pick up the new configuration.")
         else
           App.info("Cancelled.")
         end
@@ -1500,10 +1514,10 @@ defmodule Setup do
 
   defp prompt_setup_mode do
     IO.puts(:standard_error, """
-What do you want to set up?
-  [1] Claude Code only
-  [2] pi only
-  [3] Both Claude Code and pi (default)
+Which tool do you want to set up?
+  [1] Claude Code
+  [2] pi
+  [3] OpenCode
 """)
     IO.write(:standard_error, "> ")
 
@@ -1512,10 +1526,12 @@ What do you want to set up?
         case String.trim(line) do
           "1" -> :claude
           "2" -> :pi
-          _ -> :both
+          "3" -> :opencode
+          _ -> App.fatal("Invalid selection.")
         end
+
       _ ->
-        :both
+        App.fatal("No input received.")
     end
   end
 
@@ -1685,7 +1701,7 @@ What do you want to set up?
     end
   end
 
-  @gitignore_entries [".mcp.json", ".claude/", ".pi/"]
+  @gitignore_entries [".mcp.json", ".claude/", ".pi/", "opencode.json", ".opencode/"]
 
   defp plan_gitignore(path) do
     if not in_git_repo?() do
@@ -1719,6 +1735,40 @@ What do you want to set up?
 
       true ->
         %{summary: "create symlink", action: :link}
+    end
+  end
+
+  # Plans opencode.json: create or update the engram MCP entry.
+  defp plan_opencode_json(path) do
+    if File.exists?(path) do
+      case File.read!(path) |> Jason.decode() do
+        {:ok, existing} ->
+          if get_in(existing, ["mcp", "engram"]) do
+            %{summary: "update existing engram entry", action: :update}
+          else
+            %{summary: "add engram to existing file", action: :update}
+          end
+
+        {:error, _} ->
+          App.fatal("#{path} contains invalid JSON")
+      end
+    else
+      %{summary: "create", action: :create}
+    end
+  end
+
+  # Plans .opencode/instructions/engram.md: create or skip if already configured.
+  defp plan_opencode_instructions(path) do
+    if File.exists?(path) do
+      content = File.read!(path)
+
+      if String.contains?(content, "engram_remember") do
+        %{summary: "skip (already configured)", action: :skip}
+      else
+        %{summary: "update", action: :update}
+      end
+    else
+      %{summary: "create", action: :create}
     end
   end
 
@@ -1811,6 +1861,49 @@ What do you want to set up?
     source |> Path.absname() |> Path.relative_to(target_dir)
   end
 
+  defp execute_opencode_json(path, %{action: :create}, engram_path, store_names) do
+    config = %{
+      "mcp" => %{"engram" => opencode_mcp_entry(engram_path, store_names)},
+      "instructions" => [".opencode/instructions/engram.md"]
+    }
+    write_json(path, config)
+  end
+
+  defp execute_opencode_json(path, %{action: :update}, engram_path, store_names) do
+    existing = File.read!(path) |> Jason.decode!()
+
+    updated =
+      existing
+      |> put_in(
+        [Access.key("mcp", %{}), "engram"],
+        opencode_mcp_entry(engram_path, store_names)
+      )
+
+    instructions = Map.get(existing, "instructions", [])
+    instructions_path = ".opencode/instructions/engram.md"
+
+    updated =
+      if instructions_path in instructions do
+        updated
+      else
+        Map.put(updated, "instructions", instructions ++ [instructions_path])
+      end
+
+    write_json(path, updated)
+  end
+
+  defp execute_opencode_instructions(_path, %{action: :skip}, _example), do: :ok
+
+  defp execute_opencode_instructions(path, %{action: :create}, example) do
+    dir = Path.dirname(path)
+    File.mkdir_p!(dir)
+    File.write!(path, example)
+  end
+
+  defp execute_opencode_instructions(path, %{action: :update}, example) do
+    File.write!(path, example)
+  end
+
   defp execute_settings(_path, %{action: :skip}, _hooks), do: :ok
 
   defp execute_settings(path, %{action: :create}, hooks) do
@@ -1840,10 +1933,18 @@ What do you want to set up?
   # Helpers
   #-----------------------------------------------------------------------------
 
-  # Builds the MCP server entry. Always appends "global" to the store list.
+  # Builds the MCP server entry for Claude Code (.mcp.json). Always appends
+  # "global" to the store list.
   defp mcp_entry(engram_path, store_names) do
     args = ["mcp"] ++ store_names ++ ["global"]
     %{"type" => "stdio", "command" => engram_path, "args" => Enum.uniq(args)}
+  end
+
+  # Builds the MCP server entry for OpenCode (opencode.json). OpenCode uses
+  # "local" transport with a command array instead of separate command + args.
+  defp opencode_mcp_entry(engram_path, store_names) do
+    command = [engram_path, "mcp"] ++ store_names ++ ["global"]
+    %{"type" => "local", "command" => Enum.uniq(command), "enabled" => true}
   end
 
   @engram_permission "mcp__engram"
