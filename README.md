@@ -81,9 +81,8 @@ engram init --claude my-project
 engram init --opencode my-project
 
 # Global: writes to ~/.claude/.mcp.json / ~/.config/opencode/opencode.jsonc
-# No store name needed -- auto-discovery handles it for every project
-engram init --claude --global
-engram init --opencode --global
+engram init --claude --global my-project
+engram init --opencode --global my-project
 ```
 
 Global config means you run `engram init <name>` once per project (to create the store and register it), and the MCP transport config is shared across all projects via your user-level config. Per-project config keeps everything self-contained in each repo.
@@ -136,15 +135,27 @@ Store discovery uses `git rev-parse --git-common-dir`, which resolves to the mai
 
 ## Storage
 
-Stores are SQLite databases located at `~/.config/engram/<name>.db`.
-Each entry contains:
+Data is stored in a single SQLite database at `$ENGRAM_DATA_DIR/engram.db` (defaults to
+`~/.config/engram/engram.db`). Stores are rows in a `stores` table; memories are rows in an
+`entries` table keyed by (slug, store). Each memory entry contains:
 - A label (title)
 - Content (markdown text)
-- A cached embedding vector
+- An embedding vector (384 raw f32 bytes via Nx.to_binary)
 - The model name that generated the embedding
 
 ## Embedding Model
 
 `engram` uses `sentence-transformers/all-MiniLM-L12-v2` (384-dimensional vectors, 128-token training length).
+Set `ENGRAM_MODEL` to use a different HuggingFace model (must be compatible with Bumblebee for feature extraction).
 The model is downloaded from HuggingFace on first run and cached locally.
 If the model changes, use `engram reindex <name>` to regenerate all embeddings in a store.
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENGRAM_DATA_DIR` | `~/.config/engram` | Directory for the SQLite database |
+| `ENGRAM_MODEL` | `sentence-transformers/all-MiniLM-L12-v2` | HuggingFace embedding model |
+| `ENGRAM_PROJECTS_PATH` | `~/.config/engram/projects.json` | Path to the store registry |
+
+`ENGRAM_PROJECTS_PATH` is primarily for testing; normally you don't need to set it.
