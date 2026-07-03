@@ -600,45 +600,20 @@ defmodule App do
       dump             <name> ...          Output all memories for one or more stores
       recall           <name> ... -- <q>   Semantic search across one or more stores
       mcp              [<name> ... | --all]  Start the MCP server (auto-discovers stores from projects.json)
-      mcp              --config [--opencode]  Emit MCP config JSON for hand-editing into tool config
-      init             <name>              Register a store for this project directory
+      init             [--claude|--opencode] [--global] <name>  Register a store and write MCP config
 
     SETUP
       cd /path/to/myproject
-      engram init myproject
+      engram init --claude myproject       # write .mcp.json locally
+      engram init --opencode --global      # write to ~/.config/opencode/opencode.jsonc
 
-    MCP startup resolves store names from ~/.config/engram/projects.json.
-    Use explicit store args or --all to override.
+    init always registers the store in ~/.config/engram/projects.json.
+    With --claude or --opencode, it also writes the MCP transport config.
+    --global writes to the user-level config (shared across projects);
+    without --global, files go into the current directory.
     """)
 
     System.halt(exit_code)
-  end
-
-  # Emits the MCP server config JSON for the given AI tool format.
-  # The server uses auto-discovery (projects.json), so no store args are
-  # included in the command -- engram mcp resolves them at startup.
-  def mcp_config_json(:claude) do
-    Jason.encode!(%{
-      "mcpServers" => %{
-        "engram" => %{
-          "type" => "stdio",
-          "command" => script_path(),
-          "args" => ["mcp"]
-        }
-      }
-    }, pretty: true)
-  end
-
-  def mcp_config_json(:opencode) do
-    Jason.encode!(%{
-      "mcp" => %{
-        "engram" => %{
-          "type" => "local",
-          "command" => [script_path(), "mcp"],
-          "enabled" => true
-        }
-      }
-    }, pretty: true)
   end
 
   # Resolves the absolute path to this script, following symlinks recursively.
@@ -1437,21 +1412,77 @@ defmodule Store do
 end
 
 #-------------------------------------------------------------------------------
-# Init command - registers a project store for auto-discovery
+# Init command - registers a project store and optionally writes MCP config
 #-------------------------------------------------------------------------------
 defmodule Init do
   def projects_path do
     System.get_env("ENGRAM_PROJECTS_PATH", Path.expand("~/.config/engram/projects.json"))
   end
 
-  def run(store_name) do
+  def run(store_name, opts \\ []) do
     with :ok <- Store.open_db(),
          :ok <- ensure_store(store_name),
          :ok <- register(store_name) do
       App.info("Store '#{store_name}' registered for #{canonical_path()}")
+
+      cond do
+        opts[:claude] ->
+          path = config_path(:claude, opts[:global])
+          write_config(path, :claude)
+
+        opts[:opencode] ->
+          path = config_path(:opencode, opts[:global])
+          write_config(path, :opencode)
+
+        true ->
+          :ok
+      end
     else
       {:error, reason} -> App.fatal(reason)
     end
+  end
+
+  defp config_path(:claude, true), do: Path.expand("~/.claude/.mcp.json")
+  defp config_path(:claude, _), do: Path.join(File.cwd!(), ".mcp.json")
+  defp config_path(:opencode, true), do: Path.expand("~/.config/opencode/opencode.jsonc")
+  defp config_path(:opencode, _), do: Path.join(File.cwd!(), "opencode.json")
+
+  defp write_config(path, :claude) do
+    entry = %{"engram" => %{
+      "type" => "stdio",
+      "command" => App.script_path(),
+      "args" => ["mcp"]
+    }}
+    merge_json(path, "mcpServers", entry)
+  end
+
+  defp write_config(path, :opencode) do
+    entry = %{"engram" => %{
+      "type" => "local",
+      "command" => [App.script_path(), "mcp"],
+      "enabled" => true
+    }}
+    merge_json(path, "mcp", entry)
+  end
+
+  # Reads existing JSON at path, merges in the entry under key, and writes back.
+  defp merge_json(path, key, entry) do
+    dir = Path.dirname(path)
+    File.mkdir_p!(dir)
+
+    existing =
+      if File.exists?(path) do
+        case File.read!(path) |> Jason.decode() do
+          {:ok, map} when is_map(map) -> map
+          _ -> %{}
+        end
+      else
+        %{}
+      end
+
+    merged = Map.put(existing, key, Map.merge(Map.get(existing, key, %{}), entry))
+    File.write!(path, Jason.encode!(merged, pretty: true) <> "\n")
+    App.info("Wrote MCP config to #{path}")
   end
 
   defp ensure_store(name) do
@@ -1487,7 +1518,6 @@ defmodule Init do
   end
 
   # Resolves store names for the current directory from projects.json.
-  # Returns ["global"] if the file doesn't exist or the directory isn't mapped.
   def resolve_stores do
     canonical = canonical_path()
 
@@ -1877,71 +1907,75 @@ case argv do
         App.fatal(reason)
     end
 
-  ["init", name] ->
-    Init.run(name)
+  ["init" | rest] ->
+    {init_flags, init_args, _} = OptionParser.parse(rest,
+      switches: [claude: :boolean, opencode: :boolean, global: :boolean]
+    )
+
+    with [name] <- init_args do
+      opts =
+        []
+        |> then(&if init_flags[:claude], do: Keyword.put(&1, :claude, true), else: &1)
+        |> then(&if init_flags[:opencode], do: Keyword.put(&1, :opencode, true), else: &1)
+        |> then(&if init_flags[:global], do: Keyword.put(&1, :global, true), else: &1)
+
+      Init.run(name, opts)
+    else
+      _ -> App.fatal("Usage: engram init [--claude|--opencode] [--global] <name>")
+    end
 
   ["mcp" | rest] ->
     {mcp_flags, mcp_args, _} = OptionParser.parse(rest,
-      switches: [config: :boolean, claude: :boolean, opencode: :boolean, help: :boolean]
+      switches: [help: :boolean]
     )
 
     if mcp_flags[:help] do
       IO.puts(:standard_error, """
       USAGE
-        engram mcp [--config [--opencode]] [<store> ... | --all]
+        engram mcp [<store> ... | --all]
 
       OPTIONS
-        --config               Emit the MCP server config as JSON (for .mcp.json or opencode.json)
-        --claude               (with --config)  Emit Claude Code format (default)
-        --opencode             (with --config)  Emit OpenCode format
-        --all                  Serve all stores (overrides auto-discovery)
+        --all   Serve all stores (overrides auto-discovery)
 
       If no stores are given, engram resolves them from ~/.config/engram/projects.json
       using the canonical repo path (worktree-safe via git rev-parse --git-common-dir).
+
+      Use 'engram init --claude' or 'engram init --opencode' to write the MCP config
+      for your AI tool (--global for per-user, or per-project by default).
       """)
     else
-      if mcp_flags[:config] do
-        format =
+      with :ok <- Store.open_db() do
+        stores =
           cond do
-            mcp_flags[:opencode] -> :opencode
-            true -> :claude
+            mcp_args == [] ->
+              case Init.resolve_stores() do
+                [] -> App.fatal("No stores configured. Run 'engram init --claude|--opencode <name>' first.")
+                names -> names
+              end
+
+            "--all" in mcp_args ->
+              case Store.list_stores() do
+                {:ok, all} -> all
+                _ -> App.fatal("Failed to list stores")
+              end
+
+            true ->
+              mcp_args
           end
 
-        IO.puts(App.mcp_config_json(format))
-      else
-        with :ok <- Store.open_db() do
-          stores =
-            cond do
-              mcp_args == [] ->
-                case Init.resolve_stores() do
-                  [] -> App.fatal("No stores configured. Run 'engram init <name>' first.")
-                  names -> names
-                end
+        if stores == [], do: App.fatal("No stores found")
 
-              "--all" in mcp_args ->
-                case Store.list_stores() do
-                  {:ok, all} -> all
-                  _ -> App.fatal("Failed to list stores")
-                end
-
-              true ->
-                mcp_args
-            end
-
-          if stores == [], do: App.fatal("No stores found")
-
-          with :ok <- Store.validate_stores(stores) do
-            State.stores(stores)
-            App.info("Serving stores: #{Enum.join(stores, ", ")}")
-            Embeddings.ensure_started()
-            McpServer.run()
-          else
-            {:error, reason} -> App.fatal(reason)
-          end
+        with :ok <- Store.validate_stores(stores) do
+          State.stores(stores)
+          App.info("Serving stores: #{Enum.join(stores, ", ")}")
+          Embeddings.ensure_started()
+          McpServer.run()
         else
-          {:error, reason} ->
-            App.fatal(reason)
+          {:error, reason} -> App.fatal(reason)
         end
+      else
+        {:error, reason} ->
+          App.fatal(reason)
       end
     end
 

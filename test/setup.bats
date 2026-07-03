@@ -44,7 +44,6 @@ load test_helper
   [ "$status" -eq 0 ]
   [[ "$output" == *"registered for"* ]]
 
-  # projects.json doesn't have duplicate entries
   local canonical
   canonical="$(cd "$project_dir" && git rev-parse --git-common-dir)"
   canonical="$(cd "$canonical/.." && pwd -P)"
@@ -64,7 +63,6 @@ load test_helper
     git init -q
     git commit --allow-empty -m "initial" 2>/dev/null
 
-    # Create a worktree
     local wt_dir
     wt_dir="$(mktemp -d)"
     git worktree add "$wt_dir" HEAD 2>/dev/null || true
@@ -109,6 +107,87 @@ load test_helper
   [ "$status" -eq 1 ]
 }
 
+@test "init --claude writes .mcp.json" {
+  local project_dir
+  project_dir="$(mktemp -d)"
+
+  cd "$project_dir"
+  git init -q
+
+  run "$ENGRAM" init --claude testproject
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"registered for"* ]]
+  [[ "$output" == *"Wrote MCP config"* ]]
+
+  # .mcp.json was created
+  [ -f "$project_dir/.mcp.json" ]
+  [[ "$(cat "$project_dir/.mcp.json")" == *"engram"* ]]
+  [[ "$(cat "$project_dir/.mcp.json")" == *"\"type\": \"stdio\""* ]]
+  # No store args in the command - auto-discovery
+  [[ "$(cat "$project_dir/.mcp.json")" == *"\"mcp\""* ]]
+
+  rm -rf "$project_dir"
+}
+
+@test "init --opencode writes opencode.json and merges existing" {
+  local project_dir
+  project_dir="$(mktemp -d)"
+
+  cd "$project_dir"
+  git init -q
+
+  # Pre-create opencode.json with other keys
+  printf '{"lsp": true, "compaction": {"auto": false}}' > "$project_dir/opencode.json"
+
+  run "$ENGRAM" init --opencode testproject
+  [ "$status" -eq 0 ]
+
+  # Existing keys are preserved
+  [[ "$(cat "$project_dir/opencode.json")" == *"\"lsp\": true"* ]]
+  [[ "$(cat "$project_dir/opencode.json")" == *"\"auto\": false"* ]]
+
+  # MCP entry was added
+  [[ "$(cat "$project_dir/opencode.json")" == *"engram"* ]]
+  [[ "$(cat "$project_dir/opencode.json")" == *"\"type\": \"local\""* ]]
+  [[ "$(cat "$project_dir/opencode.json")" == *"\"enabled\": true"* ]]
+
+  rm -rf "$project_dir"
+}
+
+@test "init --claude --global writes to ~/.claude/.mcp.json" {
+  "$ENGRAM" create testproject 2> /dev/null
+
+  local test_home
+  test_home="$(mktemp -d)"
+  export HOME="$test_home"
+
+  run "$ENGRAM" init --claude --global testproject
+  [ "$status" -eq 0 ]
+
+  [ -f "$test_home/.claude/.mcp.json" ]
+  [[ "$(cat "$test_home/.claude/.mcp.json")" == *"engram"* ]]
+  [[ "$(cat "$test_home/.claude/.mcp.json")" == *"\"type\": \"stdio\""* ]]
+
+  rm -rf "$test_home"
+}
+
+@test "init --opencode --global writes to ~/.config/opencode/opencode.jsonc" {
+  "$ENGRAM" create testproject 2> /dev/null
+
+  local test_home
+  test_home="$(mktemp -d)"
+  export HOME="$test_home"
+
+  run "$ENGRAM" init --opencode --global testproject
+  [ "$status" -eq 0 ]
+
+  [ -f "$test_home/.config/opencode/opencode.jsonc" ]
+  [[ "$(cat "$test_home/.config/opencode/opencode.jsonc")" == *"engram"* ]]
+  [[ "$(cat "$test_home/.config/opencode/opencode.jsonc")" == *"\"type\": \"local\""* ]]
+
+  rm -rf "$test_home"
+}
+
 @test "mcp auto-discovers stores from projects.json" {
   "$ENGRAM" create teststore 2> /dev/null
 
@@ -118,7 +197,6 @@ load test_helper
   jq -nc --arg dir "$cwd" --argjson stores '["teststore","global"]' \
     '{($dir): $stores}' > "$ENGRAM_PROJECTS_PATH"
 
-  # Start MCP with no args - should auto-discover
   resp="$({
     mcp_init 1
     echo '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
@@ -128,18 +206,10 @@ load test_helper
   [ "$(jq -r '.result.tools[].name' <<< "$resp" | sort | head -1)" = "find-duplicates" ]
 }
 
-@test "mcp with empty projects.json still serves global" {
-  local cwd
-  cwd="$(pwd -P)"
+@test "mcp with empty projects.json fails with helpful message" {
+  rm -f "$ENGRAM_PROJECTS_PATH"
 
-  jq -nc --arg dir "$cwd" --argjson stores '["global"]' \
-    '{($dir): $stores}' > "$ENGRAM_PROJECTS_PATH"
-
-  resp="$({
-    mcp_init 1
-    echo '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-  } | "$ENGRAM" mcp 2>/dev/null | mcp_response_for 2)"
-
-  [ -n "$resp" ]
-  [ "$(jq -r '.result.tools[].name' <<< "$resp" | sort | head -1)" = "find-duplicates" ]
+  run "$ENGRAM" mcp
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"No stores configured"* ]]
 }

@@ -33,8 +33,7 @@ Commands:
   dump             <name> ...          Output all memories for one or more stores
   recall           <name> ... -- <q>   Semantic search across one or more stores
   mcp              [<name> ... | --all]  Start the MCP server (auto-discovers stores)
-  mcp              --config [--opencode]  Emit MCP config JSON
-  init             <name>              Register a store for this project directory
+  init             [--claude|--opencode] [--global] <name>  Register a store and write MCP config
 
 Options:
   --help    | -h      Show help
@@ -64,24 +63,34 @@ ln -s /path/to/engram/repo/engram ~/bin/engram
 
 ```bash
 cd /path/to/your/project
-engram init my-project
+engram init --claude my-project
 ```
 
-`init` creates a store named `my-project` and registers it in `~/.config/engram/projects.json` keyed by the repo's canonical path. The `global` store is included automatically for all projects.
+`init` does three things:
+1. **Creates a store** named `my-project` (if it doesn't already exist)
+2. **Registers it** in `~/.config/engram/projects.json` keyed by the repo's canonical path (worktree-safe via `git rev-parse --git-common-dir`)
+3. **Writes MCP config** for your AI tool (`--claude` or `--opencode`)
 
-### MCP Server Config
+The `global` store is included automatically for all projects.
 
-Add the MCP server to your AI tool's config. `engram mcp --config` emits the correct JSON for each tool:
+### Per-project vs Global Config
 
 ```bash
-# Claude Code (add to .mcp.json)
-engram mcp --config --claude
+# Per-project: writes .mcp.json / opencode.json in the current directory
+engram init --claude my-project
+engram init --opencode my-project
 
-# OpenCode (add to opencode.json)
-engram mcp --config --opencode
+# Global: writes to ~/.claude/.mcp.json / ~/.config/opencode/opencode.jsonc
+# No store name needed -- auto-discovery handles it for every project
+engram init --claude --global
+engram init --opencode --global
 ```
 
-Or manually:
+Global config means you run `engram init <name>` once per project (to create the store and register it), and the MCP transport config is shared across all projects via your user-level config. Per-project config keeps everything self-contained in each repo.
+
+### MCP Config Format
+
+The MCP config uses auto-discovery — no store args are needed:
 
 **Claude Code** (`.mcp.json`):
 ```json
@@ -109,17 +118,13 @@ Or manually:
 }
 ```
 
-No store args are needed -- `engram mcp` auto-discovers stores from `projects.json` using `git rev-parse --git-common-dir`, which works across worktrees.
-
-These configs can go in the project root or in your global tool config (e.g. `~/.claude/settings.json` for Claude Code).
-
 ### Prompt Instructions
 
-Add the engram instruction file to your AI tool's instructions:
+Add the engram instruction file to your AI tool's instructions (one-time setup per tool):
 
-**Claude Code**: append [example-claude.md](example-claude.md) to `.claude/CLAUDE.md` or `~/.claude/CLAUDE.md`.
+**Claude Code**: append [example-claude.md](example-claude.md) to `~/.claude/CLAUDE.md`.
 
-**OpenCode**: add `.opencode/instructions/engram.md` to your `opencode.json` instructions array.
+**OpenCode**: add `.opencode/instructions/engram.md` to your `opencode.json` instructions array. See [example-opencode.md](example-opencode.md) for the content.
 
 ### Hooks (Claude Code)
 
