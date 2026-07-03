@@ -4,6 +4,7 @@ setup() {
   local tmpdir
   tmpdir="$(mktemp -d)"
   export ENGRAM_DATA_DIR="$tmpdir"
+  export ENGRAM_PROJECTS_PATH="$tmpdir/projects.json"
 }
 
 teardown() {

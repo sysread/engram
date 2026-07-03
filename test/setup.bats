@@ -9,14 +9,6 @@ load test_helper
   cd "$project_dir"
   git init -q
 
-  ENGRAM_PROJECTS="$(echo ~/.config/engram/projects.json)"
-
-  # capture existing projects.json (may not exist)
-  local saved_projects
-  if [ -f "$ENGRAM_PROJECTS" ]; then
-    saved_projects="$(cat "$ENGRAM_PROJECTS")"
-  fi
-
   run "$ENGRAM" init testproject
 
   [ "$status" -eq 0 ]
@@ -30,16 +22,9 @@ load test_helper
   local canonical
   canonical="$(cd "$project_dir" && git rev-parse --git-common-dir)"
   canonical="$(cd "$canonical/.." && pwd -P)"
-  [[ "$(cat "$ENGRAM_PROJECTS")" == *"\"$canonical\""* ]]
-  [[ "$(cat "$ENGRAM_PROJECTS")" == *"\"testproject\""* ]]
-  [[ "$(cat "$ENGRAM_PROJECTS")" == *"\"global\""* ]]
-
-  # restore projects.json
-  if [ -n "$saved_projects" ]; then
-    echo "$saved_projects" > "$ENGRAM_PROJECTS"
-  else
-    rm -f "$ENGRAM_PROJECTS"
-  fi
+  [[ "$(cat "$ENGRAM_PROJECTS_PATH")" == *"\"$canonical\""* ]]
+  [[ "$(cat "$ENGRAM_PROJECTS_PATH")" == *"\"testproject\""* ]]
+  [[ "$(cat "$ENGRAM_PROJECTS_PATH")" == *"\"global\""* ]]
 
   rm -rf "$project_dir"
 }
@@ -50,12 +35,6 @@ load test_helper
 
   cd "$project_dir"
   git init -q
-
-  ENGRAM_PROJECTS="$(echo ~/.config/engram/projects.json)"
-  local saved_projects
-  if [ -f "$ENGRAM_PROJECTS" ]; then
-    saved_projects="$(cat "$ENGRAM_PROJECTS")"
-  fi
 
   run "$ENGRAM" init testproject
   [ "$status" -eq 0 ]
@@ -70,15 +49,8 @@ load test_helper
   canonical="$(cd "$project_dir" && git rev-parse --git-common-dir)"
   canonical="$(cd "$canonical/.." && pwd -P)"
   local count
-  count="$(jq --arg c "$canonical" '.[$c] | length' "$ENGRAM_PROJECTS")"
+  count="$(jq --arg c "$canonical" '.[$c] | length' "$ENGRAM_PROJECTS_PATH")"
   [ "$count" -eq 2 ]  # testproject + global
-
-  # restore
-  if [ -n "$saved_projects" ]; then
-    echo "$saved_projects" > "$ENGRAM_PROJECTS"
-  else
-    rm -f "$ENGRAM_PROJECTS"
-  fi
 
   rm -rf "$project_dir"
 }
@@ -92,12 +64,6 @@ load test_helper
     git init -q
     git commit --allow-empty -m "initial" 2>/dev/null
 
-    ENGRAM_PROJECTS="$(echo ~/.config/engram/projects.json)"
-    local saved_projects
-    if [ -f "$ENGRAM_PROJECTS" ]; then
-      saved_projects="$(cat "$ENGRAM_PROJECTS")"
-    fi
-
     # Create a worktree
     local wt_dir
     wt_dir="$(mktemp -d)"
@@ -110,17 +76,10 @@ load test_helper
       [ "$status" -eq 0 ]
 
       # projects.json key should be the main repo, not the worktree
-      [[ "$(cat "$ENGRAM_PROJECTS")" != *"$wt_dir"* ]]
-      [ -n "$(cat "$ENGRAM_PROJECTS")" ]
+      [[ "$(cat "$ENGRAM_PROJECTS_PATH")" != *"$wt_dir"* ]]
+      [ -n "$(cat "$ENGRAM_PROJECTS_PATH")" ]
 
       git worktree remove "$wt_dir" 2>/dev/null || rm -rf "$wt_dir"
-    fi
-
-    # restore
-    if [ -n "$saved_projects" ]; then
-      echo "$saved_projects" > "$ENGRAM_PROJECTS"
-    else
-      rm -f "$ENGRAM_PROJECTS"
     fi
 
     rm -rf "$main_dir"
@@ -135,25 +94,12 @@ load test_helper
 
   cd "$project_dir"
 
-  ENGRAM_PROJECTS="$(echo ~/.config/engram/projects.json)"
-  local saved_projects
-  if [ -f "$ENGRAM_PROJECTS" ]; then
-    saved_projects="$(cat "$ENGRAM_PROJECTS")"
-  fi
-
   run "$ENGRAM" init nonrepo
   [ "$status" -eq 0 ]
 
   local resolved
   resolved="$(cd "$project_dir" && pwd -P)"
-  [[ "$(cat "$ENGRAM_PROJECTS")" == *"\"$resolved\""* ]]
-
-  # restore
-  if [ -n "$saved_projects" ]; then
-    echo "$saved_projects" > "$ENGRAM_PROJECTS"
-  else
-    rm -f "$ENGRAM_PROJECTS"
-  fi
+  [[ "$(cat "$ENGRAM_PROJECTS_PATH")" == *"\"$resolved\""* ]]
 
   rm -rf "$project_dir"
 }
@@ -166,19 +112,11 @@ load test_helper
 @test "mcp auto-discovers stores from projects.json" {
   "$ENGRAM" create teststore 2> /dev/null
 
-  ENGRAM_PROJECTS="$(echo ~/.config/engram/projects.json)"
-  local saved_projects
-  if [ -f "$ENGRAM_PROJECTS" ]; then
-    saved_projects="$(cat "$ENGRAM_PROJECTS")"
-  fi
-
-  mkdir -p "$(dirname "$ENGRAM_PROJECTS")"
   local cwd
   cwd="$(pwd -P)"
 
-  # Register current directory
   jq -nc --arg dir "$cwd" --argjson stores '["teststore","global"]' \
-    '{($dir): $stores}' > "$ENGRAM_PROJECTS"
+    '{($dir): $stores}' > "$ENGRAM_PROJECTS_PATH"
 
   # Start MCP with no args - should auto-discover
   resp="$({
@@ -188,29 +126,14 @@ load test_helper
 
   [ -n "$resp" ]
   [ "$(jq -r '.result.tools[].name' <<< "$resp" | sort | head -1)" = "find-duplicates" ]
-
-  # restore
-  if [ -n "$saved_projects" ]; then
-    echo "$saved_projects" > "$ENGRAM_PROJECTS"
-  else
-    rm -f "$ENGRAM_PROJECTS"
-  fi
 }
 
 @test "mcp with empty projects.json still serves global" {
-  ENGRAM_PROJECTS="$(echo ~/.config/engram/projects.json)"
-  local saved_projects
-  if [ -f "$ENGRAM_PROJECTS" ]; then
-    saved_projects="$(cat "$ENGRAM_PROJECTS")"
-  fi
-
-  mkdir -p "$(dirname "$ENGRAM_PROJECTS")"
   local cwd
   cwd="$(pwd -P)"
 
-  # Register with only global - no project store
   jq -nc --arg dir "$cwd" --argjson stores '["global"]' \
-    '{($dir): $stores}' > "$ENGRAM_PROJECTS"
+    '{($dir): $stores}' > "$ENGRAM_PROJECTS_PATH"
 
   resp="$({
     mcp_init 1
@@ -219,11 +142,4 @@ load test_helper
 
   [ -n "$resp" ]
   [ "$(jq -r '.result.tools[].name' <<< "$resp" | sort | head -1)" = "find-duplicates" ]
-
-  # restore
-  if [ -n "$saved_projects" ]; then
-    echo "$saved_projects" > "$ENGRAM_PROJECTS"
-  else
-    rm -f "$ENGRAM_PROJECTS"
-  fi
 }

@@ -32,8 +32,9 @@ Commands:
   show             <name> <slug>       Display a single memory by slug
   dump             <name> ...          Output all memories for one or more stores
   recall           <name> ... -- <q>   Semantic search across one or more stores
-  mcp              <name> ... | --all  Start the MCP server (stdio transport)
-  setup                                Configure engram for the current directory
+  mcp              [<name> ... | --all]  Start the MCP server (auto-discovers stores)
+  mcp              --config [--opencode]  Emit MCP config JSON
+  init             <name>              Register a store for this project directory
 
 Options:
   --help    | -h      Show help
@@ -63,65 +64,70 @@ ln -s /path/to/engram/repo/engram ~/bin/engram
 
 ```bash
 cd /path/to/your/project
-engram setup
+engram init my-project
 ```
 
-`setup` prompts you for:
-- **Setup mode**: Claude Code only, pi only, or both
-- **Store selection**: choose existing stores or create new ones
+`init` creates a store named `my-project` and registers it in `~/.config/engram/projects.json` keyed by the repo's canonical path. The `global` store is included automatically for all projects.
 
-Based on your choices, `setup` writes to:
-- `.mcp.json` - MCP server config (Claude Code)
-- `.claude/CLAUDE.md` - prompt instructions for Claude Code
-- `.claude/settings.local.json` - session hooks for automatic recall/write
-- `.pi/extensions/engram.ts` - pi extension for native integration
-- `.gitignore` - adds config paths to keep them out of version control
+### MCP Server Config
 
-A `global` store is always included automatically.
+Add the MCP server to your AI tool's config. `engram mcp --config` emits the correct JSON for each tool:
 
-Before making changes, `setup` shows a summary of what it will do and prompts for confirmation.
+```bash
+# Claude Code (add to .mcp.json)
+engram mcp --config --claude
 
-## Manual Configuration
+# OpenCode (add to opencode.json)
+engram mcp --config --opencode
+```
 
-If you prefer to configure manually, these are the steps `setup` automates.
+Or manually:
 
-### MCP Server
-
-Add a `.mcp.json` file to the root of your project:
-
+**Claude Code** (`.mcp.json`):
 ```json
 {
   "mcpServers": {
     "engram": {
       "type": "stdio",
       "command": "/absolute/path/to/engram",
-      "args": ["mcp", "my-project", "global"]
+      "args": ["mcp"]
     }
   }
 }
 ```
 
-### Prompt Instructions
-
-Add the contents of [example-claude.md](example-claude.md) to `.claude/CLAUDE.md` or `~/.claude/CLAUDE.md` to instruct Claude Code on how and when to use the memory tools.
-
-```bash
-cat example-claude.md >> .claude/CLAUDE.md
+**OpenCode** (`opencode.json`):
+```json
+{
+  "mcp": {
+    "engram": {
+      "type": "local",
+      "command": ["/absolute/path/to/engram", "mcp"],
+      "enabled": true
+    }
+  }
+}
 ```
 
-### Hooks
+No store args are needed -- `engram mcp` auto-discovers stores from `projects.json` using `git rev-parse --git-common-dir`, which works across worktrees.
 
-Add the hooks from [example-hooks.json](example-hooks.json) to `.claude/settings.local.json`.
-These automate the recall/write cycle so engram use is habitual rather than opt-in:
-- **SessionStart**: recalls context from prior sessions before responding
-- **UserPromptSubmit**: evaluates each exchange for persistable knowledge
+These configs can go in the project root or in your global tool config (e.g. `~/.claude/settings.json` for Claude Code).
+
+### Prompt Instructions
+
+Add the engram instruction file to your AI tool's instructions:
+
+**Claude Code**: append [example-claude.md](example-claude.md) to `.claude/CLAUDE.md` or `~/.claude/CLAUDE.md`.
+
+**OpenCode**: add `.opencode/instructions/engram.md` to your `opencode.json` instructions array.
+
+### Hooks (Claude Code)
+
+Add the hooks from [example-hooks.json](example-hooks.json) to `.claude/settings.local.json`. These automate recall on session start and prompt evaluation for new knowledge.
 
 ## Sharing a Store Across Worktrees
 
-The store name (e.g., `my-project`) is what determines which SQLite database engram reads and writes.
-Multiple MCP server instances can safely share the same store concurrently - SQLite handles the locking.
-
-All worktrees share the same `.mcp.json` from the repo root, so the config is automatically consistent.
+Store discovery uses `git rev-parse --git-common-dir`, which resolves to the main repo's `.git` directory even from inside a worktree. All worktrees map to the same key in `projects.json`, so store lists are automatically consistent.
 
 ## Storage
 
