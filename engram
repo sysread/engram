@@ -289,7 +289,7 @@ defmodule ListMemories do
     end
   end
 
-  defp format_entry(%Store.Entry{label: label, store: store, branch: branch, confidence: confidence, updated_at: updated_at}) do
+  defp format_entry(%{label: label, store: store, branch: branch, confidence: confidence, updated_at: updated_at}) do
     scope = Store.format_scope(store, branch)
 
     meta =
@@ -343,7 +343,7 @@ defmodule RecallMemories do
     end
   end
 
-  defp format_result(%Store.Entry{content: content, store: store, branch: branch, confidence: confidence}) do
+  defp format_result(%{content: content, store: store, branch: branch, confidence: confidence}) do
     meta =
       Store.format_meta([
         {store, &"store:#{&1}"},
