@@ -1440,7 +1440,9 @@ end
 # Init command - registers a project store for auto-discovery
 #-------------------------------------------------------------------------------
 defmodule Init do
-  @projects_path System.get_env("ENGRAM_PROJECTS_PATH", Path.expand("~/.config/engram/projects.json"))
+  def projects_path do
+    System.get_env("ENGRAM_PROJECTS_PATH", Path.expand("~/.config/engram/projects.json"))
+  end
 
   def run(store_name) do
     with :ok <- Store.open_db(),
@@ -1489,8 +1491,8 @@ defmodule Init do
   def resolve_stores do
     canonical = canonical_path()
 
-    if File.exists?(@projects_path) do
-      case File.read!(@projects_path) |> Jason.decode() do
+    if File.exists?(projects_path()) do
+      case File.read!(projects_path()) |> Jason.decode() do
         {:ok, map} when is_map(map) -> Map.get(map, canonical, [])
         _ -> []
       end
@@ -1500,8 +1502,8 @@ defmodule Init do
   end
 
   defp read_projects do
-    if File.exists?(@projects_path) do
-      case File.read!(@projects_path) |> Jason.decode() do
+    if File.exists?(projects_path()) do
+      case File.read!(projects_path()) |> Jason.decode() do
         {:ok, map} when is_map(map) -> map
         _ -> %{}
       end
@@ -1511,9 +1513,9 @@ defmodule Init do
   end
 
   defp write_projects(map) do
-    dir = Path.dirname(@projects_path)
+    dir = Path.dirname(projects_path())
     File.mkdir_p!(dir)
-    File.write!(@projects_path, Jason.encode!(map, pretty: true) <> "\n")
+    File.write!(projects_path(), Jason.encode!(map, pretty: true) <> "\n")
   end
 end
 
