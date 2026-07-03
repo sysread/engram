@@ -61,6 +61,8 @@ load test_helper
 
     cd "$main_dir"
     git init -q
+    git config user.email "test@example.com"
+    git config user.name "test"
     git commit --allow-empty -m "initial" 2>/dev/null
 
     local wt_dir
