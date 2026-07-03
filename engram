@@ -598,13 +598,16 @@ defmodule App do
       move             <src> <dst> <slug>...  Move memories to another store (keeps embedding)
       show             <name> <slug>       Display a single memory by slug
       dump             <name> ...          Output all memories for one or more stores
-      recall           <name> ... -- <q>   Semantic search across one or more stores
-      mcp              <name> ... | --all  Start the MCP server (stdio transport)
-      setup                                Configure engram for the current directory
+       recall           <name> ... -- <q>   Semantic search across one or more stores
+      mcp              [<name> ... | --all]  Start the MCP server (auto-discovers stores from projects.json)
+      init             <name>              Register a store for this project directory
 
     SETUP
       cd /path/to/myproject
-      engram setup
+      engram init myproject
+
+    MCP startup resolves store names from ~/.config/engram/projects.json.
+    Use explicit store args or --all to override.
     """)
 
     System.halt(exit_code)
@@ -1406,654 +1409,83 @@ defmodule Store do
 end
 
 #-------------------------------------------------------------------------------
-# Setup command - configures engram for a project directory
+# Init command - registers a project store for auto-discovery
 #-------------------------------------------------------------------------------
-defmodule Setup do
-  @engram_permission "mcp__engram"
-  @gitignore_entries [".mcp.json", ".claude/", ".pi/", "opencode.json", ".opencode/"]
-
-  # Backend definitions: label, the file ops to plan/execute, and how to build
-  # the MCP server entry for each tool's config format.
-  @backends %{
-    claude: %{
-      label: "Claude Code",
-      mcp_entry_fn: :mcp_entry,
-      ops: [
-        mcp_json: ".mcp.json",
-        instructions: {".claude/CLAUDE.md", "example-claude.md", "mcp__engram__"},
-        settings: {".claude/settings.local.json", "example-hooks.json"},
-      ]
-    },
-    opencode: %{
-      label: "OpenCode",
-      mcp_entry_fn: :opencode_mcp_entry,
-      ops: [
-        opencode_json: "opencode.json",
-        instructions: {".opencode/instructions/engram.md", "example-opencode.md", "engram_remember"},
-        plugin: {".opencode/plugins/engram.ts", "engram-plugin.ts"},
-      ]
-    },
-    pi: %{
-      label: "pi",
-      mcp_entry_fn: nil,
-      ops: [
-        pi_extension: {".pi/extensions/engram.ts", "pi-extension.ts"},
-      ]
-    },
-  }
-
-  #-----------------------------------------------------------------------------
-  # Main entry point
-  #-----------------------------------------------------------------------------
-  def run(engram_path) do
-    cwd = File.cwd!()
-    engram_dir = Path.dirname(engram_path)
-
-    mode = prompt_setup_mode()
-    store_names = prompt_stores()
-    backend = @backends[mode]
-
-    # Read source templates once at the top
-    sources = read_sources(engram_dir, backend)
-
-    # Plan each file operation and collect results
-    plans =
-      backend.ops
-      |> Keyword.keys()
-      |> Enum.map(&plan_op(&1, backend.ops[&1], engram_path, store_names, cwd, engram_dir, sources))
-
-    store_plan = plan_stores(store_names)
-    gitignore_plan = plan_gitignore(cwd)
-
-    # Print summary
-    print_summary(cwd, backend.label, store_names, store_plan, plans, gitignore_plan, mode)
-
-    IO.write(:standard_error, "Proceed? [y/N] ")
-
-    case IO.read(:stdio, :line) do
-      line when is_binary(line) ->
-        if String.trim(line) |> String.downcase() == "y" do
-          execute_stores(store_plan)
-          Enum.each(plans, &execute_op/1)
-          execute_gitignore(cwd, gitignore_plan)
-          App.info("Done. Restart #{backend.label} to pick up the new configuration.")
-        else
-          App.info("Cancelled.")
-        end
-
-      _ ->
-        App.info("Cancelled.")
-    end
-  end
-
-  #-----------------------------------------------------------------------------
-  # Source file loading (shared across all ops)
-  #-----------------------------------------------------------------------------
-  defp read_sources(engram_dir, backend) do
-    backend.ops
-    |> Enum.reduce(%{}, fn {_key, spec}, acc ->
-      src = source_from_spec(spec)
-      if src && !Map.has_key?(acc, src) do
-        full_path = Path.join(engram_dir, src)
-        unless File.exists?(full_path) do
-          App.fatal("Missing #{full_path} - is the engram installation intact?")
-        end
-        content = File.read!(full_path)
-        Map.put(acc, src, content)
-      else
-        acc
-      end
-    end)
-  end
-
-  # Extracts the source filename from an op spec, if any.
-  defp source_from_spec({_, source, _marker}), do: source
-  defp source_from_spec({_, source}), do: source
-  defp source_from_spec(_), do: nil
-
-  #-----------------------------------------------------------------------------
-  # Planning -- each op type has a plan function that returns:
-  #   %{path: target_path(s), summary: string, action: atom, extra: term}
-  #-----------------------------------------------------------------------------
-  defp plan_op(:mcp_json, path, engram_path, store_names, cwd, _engram_dir, _sources) do
-    full_path = Path.join(cwd, path)
-
-    if File.exists?(full_path) do
-      case File.read!(full_path) |> Jason.decode() do
-        {:ok, existing} ->
-          if get_in(existing, ["mcpServers", "engram"]) do
-            %{path: full_path, summary: "update existing engram entry", action: :update, config_path: path}
-          else
-            %{path: full_path, summary: "add engram to existing file", action: :update, config_path: path}
-          end
-
-        {:error, _} ->
-          App.fatal("#{full_path} contains invalid JSON")
-      end
-    else
-      %{path: full_path, summary: "create", action: :create, config_path: path}
-    end
-    |> Map.put(:config_path, path)
-    |> then(&Map.put(&1, :extra, %{engram_path: engram_path, store_names: store_names, entry_fn: :mcp_entry}))
-  end
-
-  defp plan_op(:opencode_json, path, engram_path, store_names, cwd, _engram_dir, _sources) do
-    full_path = Path.join(cwd, path)
-
-    if File.exists?(full_path) do
-      case File.read!(full_path) |> Jason.decode() do
-        {:ok, existing} ->
-          if get_in(existing, ["mcp", "engram"]) do
-            %{path: full_path, summary: "update existing engram entry", action: :update, config_path: path}
-          else
-            %{path: full_path, summary: "add engram to existing file", action: :update, config_path: path}
-          end
-
-        {:error, _} ->
-          App.fatal("#{full_path} contains invalid JSON")
-      end
-    else
-      %{path: full_path, summary: "create", action: :create, config_path: path}
-    end
-    |> Map.put(:extra, %{engram_path: engram_path, store_names: store_names, entry_fn: :opencode_mcp_entry})
-  end
-
-  defp plan_op(:instructions, {path, source, marker}, _engram_path, _store_names, cwd, _engram_dir, sources) do
-    full_path = Path.join(cwd, path)
-
-    if File.exists?(full_path) do
-      content = File.read!(full_path)
-
-      if String.contains?(content, marker) do
-        %{path: full_path, summary: "skip (already configured)", action: :skip}
-      else
-        %{path: full_path, summary: "update", action: :update, source_content: Map.get(sources, source)}
-      end
-    else
-      %{path: full_path, summary: "create", action: :create, source_content: Map.get(sources, source)}
-    end
-  end
-
-  defp plan_op(:settings, {path, source}, _engram_path, _store_names, cwd, _engram_dir, sources) do
-    full_path = Path.join(cwd, path)
-    dir = Path.dirname(full_path)
-    hooks = Map.get(sources, source) |> Jason.decode!()
-
-    cond do
-      File.exists?(full_path) ->
-        case File.read!(full_path) |> Jason.decode() do
-          {:ok, existing} ->
-            has_hooks = has_engram_hooks?(existing)
-            has_perm = has_engram_permission?(existing)
-
-            cond do
-              has_hooks and has_perm ->
-                %{path: full_path, summary: "skip (already configured)", action: :skip}
-
-              has_hooks ->
-                %{path: full_path, summary: "add engram permission", action: :update, extra: %{hooks: hooks, merge_hooks: false}}
-
-              has_perm ->
-                %{path: full_path, summary: "add engram hooks", action: :update, extra: %{hooks: hooks, merge_hooks: true}}
-
-              true ->
-                %{path: full_path, summary: "add engram hooks and permission", action: :update, extra: %{hooks: hooks, merge_hooks: true}}
-            end
-
-          {:error, _} ->
-            App.fatal("#{full_path} contains invalid JSON")
-        end
-
-      File.dir?(dir) ->
-        %{path: full_path, summary: "create", action: :create, extra: %{hooks: hooks, merge_hooks: true}}
-
-      true ->
-        %{path: full_path, summary: "create .claude/ directory and file", action: :create, extra: %{hooks: hooks, merge_hooks: true}}
-    end
-  end
-
-  defp plan_op(:plugin, {path, source}, _engram_path, _store_names, cwd, engram_dir, _sources) do
-    full_path = Path.join(cwd, path)
-
-    if File.exists?(full_path) do
-      %{path: full_path, summary: "skip (already deployed)", action: :skip}
-    else
-      %{path: full_path, summary: "create", action: :create, extra: %{source_path: Path.join(engram_dir, source)}}
-    end
-  end
-
-  defp plan_op(:pi_extension, {path, source}, _engram_path, _store_names, cwd, engram_dir, _sources) do
-    full_path = Path.join(cwd, path)
-    source_path = Path.join(engram_dir, source)
-
-    cond do
-      not File.exists?(source_path) ->
-        %{path: full_path, summary: "source not found", action: :skip}
-
-      File.exists?(full_path) ->
-        real_target =
-          case File.read_link(full_path) do
-            {:ok, link} -> link
-            _ -> :not_link
-          end
-
-        if real_target == "../../pi-extension.ts" do
-          %{path: full_path, summary: "already linked", action: :skip}
-        else
-          %{path: full_path, summary: "update symlink", action: :link, extra: %{source_path: source_path}}
-        end
-
-      true ->
-        %{path: full_path, summary: "create symlink", action: :link, extra: %{source_path: source_path}}
-    end
-  end
-
-  #-----------------------------------------------------------------------------
-  # Shared planning (mode-independent)
-  #-----------------------------------------------------------------------------
-  defp plan_stores(names) do
-    all_needed = Enum.uniq(names ++ ["global"])
-
-    existing =
-      case Store.list_stores() do
-        {:ok, s} -> s
-        _ -> []
-      end
-
-    to_create = all_needed -- existing
-    already = all_needed -- to_create
-
-    parts = []
-    parts = if to_create != [], do: parts ++ ["create #{Enum.join(to_create, ", ")}"], else: parts
-    parts = if already != [], do: parts ++ ["#{Enum.join(already, ", ")} already exist"], else: parts
-
-    %{summary: Enum.join(parts, "; "), to_create: to_create}
-  end
-
-  defp plan_gitignore(cwd) do
-    gitignore_path = Path.join(cwd, ".gitignore")
-
-    if not in_git_repo?() do
-      %{summary: "skip (not a git repo)", action: :skip}
-    else
-      needed = Enum.reject(@gitignore_entries, &git_ignored?/1)
-
-      case {File.exists?(gitignore_path), needed} do
-        {_, []} -> %{summary: "skip (already ignored)", action: :skip}
-        {true, entries} -> %{summary: "append #{Enum.join(entries, " and ")}", action: :append, path: gitignore_path, entries: entries}
-        {false, _} -> %{summary: "create", action: :create, path: gitignore_path}
-      end
-    end
-  end
-
-  #-----------------------------------------------------------------------------
-  # Execution -- dispatches on action and op content
-  #-----------------------------------------------------------------------------
-  defp execute_op(%{action: :skip}), do: :ok
-
-  # MCP JSON config (Claude Code .mcp.json or OpenCode opencode.json)
-  defp execute_op(%{action: :create, config_path: path} = plan) do
-    make_config(path, plan.extra)
-  end
-
-  defp execute_op(%{action: :update, config_path: path} = plan) do
-    existing = File.read!(plan.path) |> Jason.decode!()
-    updated = merge_config(path, existing, plan.extra)
-    write_json(plan.path, updated)
-  end
-
-  # Settings (Claude Code settings.local.json) -- merge hooks and permissions
-  defp execute_op(%{action: action, extra: %{hooks: hooks} = extra} = plan)
-       when action in [:create, :update] do
-    File.mkdir_p!(Path.dirname(plan.path))
-    execute_settings_merge(plan.path, hooks, extra.merge_hooks)
-  end
-
-  # Instructions (markdown templates) -- write the source template
-  defp execute_op(%{action: action, source_content: content} = plan)
-       when action in [:create, :update] do
-    dir = Path.dirname(plan.path)
-    File.mkdir_p!(dir)
-    File.write!(plan.path, content)
-  end
-
-  # Plugin file copy
-  defp execute_op(%{action: :create, extra: %{source_path: src}} = plan) do
-    dir = Path.dirname(plan.path)
-    File.mkdir_p!(dir)
-    File.cp!(src, plan.path)
-  end
-
-  # Symlink (pi extension)
-  defp execute_op(%{action: :link} = plan) do
-    dir = Path.dirname(plan.path)
-    File.mkdir_p!(dir)
-
-    if File.exists?(plan.path) do
-      File.rm!(plan.path)
-    end
-
-    target = relative_symlink_target(plan.path, plan.extra.source_path)
-    File.ln_s!(target, plan.path)
-  end
-
-  #-----------------------------------------------------------------------------
-  # MCP config builders -- shared between planning and execution
-  #-----------------------------------------------------------------------------
-  defp make_config(".mcp.json", extra) do
-    config = %{"mcpServers" => %{"engram" => mcp_entry(extra.engram_path, extra.store_names)}}
-    write_json(Path.join(File.cwd!(), ".mcp.json"), config)
-  end
-
-  defp make_config("opencode.json", extra) do
-    config = %{
-      "mcp" => %{"engram" => opencode_mcp_entry(extra.engram_path, extra.store_names)},
-      "instructions" => [".opencode/instructions/engram.md"]
-    }
-    write_json(Path.join(File.cwd!(), "opencode.json"), config)
-  end
-
-  defp merge_config(".mcp.json", existing, extra) do
-    put_in(
-      existing,
-      [Access.key("mcpServers", %{}), "engram"],
-      mcp_entry(extra.engram_path, extra.store_names)
-    )
-  end
-
-  defp merge_config("opencode.json", existing, extra) do
-    updated =
-      put_in(
-        existing,
-        [Access.key("mcp", %{}), "engram"],
-        opencode_mcp_entry(extra.engram_path, extra.store_names)
-      )
-
-    instructions = Map.get(existing, "instructions", [])
-    instructions_path = ".opencode/instructions/engram.md"
-
-    if instructions_path in instructions do
-      updated
-    else
-      Map.put(updated, "instructions", instructions ++ [instructions_path])
-    end
-  end
-
-  # Builds the MCP server entry for Claude Code (.mcp.json). Always appends
-  # "global" to the store list.
-  defp mcp_entry(engram_path, store_names) do
-    args = ["mcp"] ++ store_names ++ ["global"]
-    %{"type" => "stdio", "command" => engram_path, "args" => Enum.uniq(args)}
-  end
-
-  # Builds the MCP server entry for OpenCode (opencode.json). OpenCode uses
-  # "local" transport with a command array instead of separate command + args.
-  defp opencode_mcp_entry(engram_path, store_names) do
-    command = [engram_path, "mcp"] ++ store_names ++ ["global"]
-    %{"type" => "local", "command" => Enum.uniq(command), "enabled" => true}
-  end
-
-  #-----------------------------------------------------------------------------
-  # Settings merging (Claude Code specific)
-  #-----------------------------------------------------------------------------
-  defp has_engram_hooks?(settings) do
-    hooks = Map.get(settings, "hooks", %{})
-
-    Enum.all?(["SessionStart", "UserPromptSubmit"], fn event ->
-      hooks
-      |> Map.get(event, [])
-      |> Enum.any?(fn group ->
-        group
-        |> Map.get("hooks", [])
-        |> Enum.any?(fn h -> String.contains?(Map.get(h, "command", ""), "[engram]") end)
-      end)
-    end)
-  end
-
-  defp has_engram_permission?(settings) do
-    settings
-    |> get_in(["permissions", "allow"])
-    |> is_list()
-    |> then(fn true -> @engram_permission in get_in(settings, ["permissions", "allow"]); false -> false end)
-  end
-
-  #-----------------------------------------------------------------------------
-  # Shared gitignore
-  #-----------------------------------------------------------------------------
-  defp execute_gitignore(_cwd, %{action: :skip}), do: :ok
-
-  defp execute_gitignore(cwd, %{action: :create}) do
-    File.write!(Path.join(cwd, ".gitignore"), Enum.join(@gitignore_entries, "\n") <> "\n")
-  end
-
-  defp execute_gitignore(cwd, %{action: :append} = plan) do
-    path = plan.path || Path.join(cwd, ".gitignore")
-    content = File.read!(path)
-    separator = if String.ends_with?(content, "\n"), do: "", else: "\n"
-    File.write!(path, content <> separator <> Enum.join(plan.entries, "\n") <> "\n")
-  end
-
-  defp in_git_repo? do
-    match?({_, 0}, System.cmd("git", ["rev-parse", "--git-dir"], stderr_to_stdout: true))
-  end
-
-  defp git_ignored?(path) do
-    match?({_, 0}, System.cmd("git", ["check-ignore", "-q", path], stderr_to_stdout: true))
-  end
-
-  #-----------------------------------------------------------------------------
-  # Store execution (shared)
-  #-----------------------------------------------------------------------------
-  defp execute_stores(%{to_create: names}) do
-    Enum.each(names, &Store.create/1)
-  end
-
-  #-----------------------------------------------------------------------------
-  # Summary printing
-  #-----------------------------------------------------------------------------
-  defp print_summary(cwd, label, store_names, store_plan, plans, gitignore_plan, mode) do
-    mcp_stores_label = (store_names ++ ["global"]) |> Enum.join(", ")
-
-    lines =
-      plans
-      |> Enum.map(fn %{path: p, summary: s} ->
-        rel = Path.relative_to(p, cwd)
-        "      #{String.pad_trailing(rel, 30)} #{s}"
-      end)
-
-    oc_lines = if mode == :opencode, do: lines, else: ["      opencode.*:                   skipped"]
-    claude_lines = if mode == :claude, do: lines, else: ["      .claude/*:                    skipped"]
-    pi_line = if mode == :pi, do: lines, else: ["      Pi extension:                 (not selected)"]
-
-    IO.puts(:standard_error, """
-
-    engram setup for '#{cwd}' (mode: #{label})
-
-      Stores (MCP):                 #{mcp_stores_label}
-      Store changes:                #{store_plan.summary}
-    #{Enum.join(oc_lines, "\n")}
-    #{Enum.join(claude_lines, "\n")}
-      .gitignore:                   #{gitignore_plan.summary}
-    #{Enum.join(pi_line, "\n")}
-    """)
-
-    if gitignore_plan.action != :skip do
-      IO.puts(:standard_error, "  Note: .mcp.json, opencode.json, .claude/, and .opencode/ will be gitignored.")
-      IO.puts(:standard_error, "  Remove from .gitignore to share with your team.\n")
-    end
-  end
-
-  #-----------------------------------------------------------------------------
-  # Settings file execution
-  #-----------------------------------------------------------------------------
-  defp execute_settings_merge(full_path, source_hooks, merge_hooks) do
-    if File.exists?(full_path) do
-      existing = File.read!(full_path) |> Jason.decode!()
-      updated = merge_settings(existing, source_hooks, merge_hooks)
-      write_json(full_path, updated)
-    else
-      settings = merge_settings(%{}, source_hooks, merge_hooks)
-      write_json(full_path, settings)
-    end
-  end
-
-  defp merge_settings(existing, source_hooks, merge_hooks) do
-    existing
-    |> then(fn s -> if merge_hooks, do: merge_hooks_config(s, source_hooks), else: s end)
-    |> merge_permission()
-  end
-
-  defp merge_hooks_config(existing, source_hooks) do
-    source_hook_map = Map.get(source_hooks, "hooks", %{})
-    existing_hooks = Map.get(existing, "hooks", %{})
-
-    merged =
-      Enum.reduce(source_hook_map, existing_hooks, fn {event, entries}, acc ->
-        existing_entries = Map.get(acc, event, [])
-
-        already_present =
-          Enum.any?(existing_entries, fn group ->
-            group
-            |> Map.get("hooks", [])
-            |> Enum.any?(fn h -> String.contains?(Map.get(h, "command", ""), "[engram]") end)
-          end)
-
-        if already_present, do: acc, else: Map.put(acc, event, existing_entries ++ entries)
-      end)
-
-    Map.put(existing, "hooks", merged)
-  end
-
-  defp merge_permission(settings) do
-    allow = get_in(settings, ["permissions", "allow"]) || []
-
-    if @engram_permission in allow do
-      settings
-    else
-      put_in(settings, [Access.key("permissions", %{}), Access.key("allow", [])], allow ++ [@engram_permission])
-    end
-  end
-
-  defp relative_symlink_target(target, source) do
-    target_dir = Path.dirname(target)
-    source |> Path.absname() |> Path.relative_to(target_dir)
-  end
-
-  defp write_json(path, data) do
-    File.write!(path, Jason.encode!(data, pretty: true) <> "\n")
-  end
-
-  #-----------------------------------------------------------------------------
-  # Interactive prompts
-  #-----------------------------------------------------------------------------
-  defp prompt_setup_mode do
-    IO.puts(:standard_error, """
-    Which tool do you want to set up?
-      [1] Claude Code
-      [2] pi
-      [3] OpenCode
-    """)
-    IO.write(:standard_error, "> ")
-
-    case IO.read(:stdio, :line) do
-      line when is_binary(line) ->
-        case String.trim(line) do
-          "1" -> :claude
-          "2" -> :pi
-          "3" -> :opencode
-          _ -> App.fatal("Invalid selection.")
-        end
-
-      _ ->
-        App.fatal("No input received.")
-    end
-  end
-
-  defp prompt_stores do
-    with :ok <- Store.open_db() do
-      existing =
-        case Store.list_stores() do
-          {:ok, stores} -> stores -- ["global"]
-          _ -> []
-        end
-
-      if existing != [] do
-        IO.puts(:standard_error, "\nExisting stores:")
-
-        Enum.each(existing, fn name ->
-          IO.puts(:standard_error, "  - #{name}")
-        end)
-
-        IO.puts(:standard_error, "")
-      end
-
-      IO.puts(:standard_error, "Enter stores separated by spaces.")
-      IO.puts(:standard_error, "Use NEW to create a new store.\n")
-      IO.write(:standard_error, "> ")
-
-      case IO.read(:stdio, :line) do
-        line when is_binary(line) ->
-          parse_store_input(line, existing)
-
-        _ ->
-          App.fatal("No input received.")
-      end
+defmodule Init do
+  @projects_path Path.expand("~/.config/engram/projects.json")
+
+  def run(store_name) do
+    with :ok <- Store.open_db(),
+         :ok <- ensure_store(store_name),
+         :ok <- register(store_name) do
+      App.info("Store '#{store_name}' registered for #{canonical_path()}")
     else
       {:error, reason} -> App.fatal(reason)
     end
   end
 
-  defp parse_store_input(line, existing) do
-    tokens =
-      line
-      |> String.replace(~r/["']/, "")
-      |> String.split()
-      |> Enum.map(&String.trim/1)
-      |> Enum.reject(&(&1 == ""))
+  defp ensure_store(name) do
+    already_exists = "Store '#{name}' already exists."
 
-    if tokens == [] do
-      App.fatal("No stores specified.")
+    case Store.create(name) do
+      {:ok, _} -> :ok
+      {:error, ^already_exists} -> :ok
+      {:error, reason} -> {:error, reason}
     end
-
-    names =
-      Enum.flat_map(tokens, fn token ->
-        if String.upcase(token) == "NEW" do
-          [prompt_new_store_name()]
-        else
-          case Store.validate_name(token) do
-            :ok -> [token]
-            {:error, reason} -> App.fatal(reason)
-          end
-        end
-      end)
-
-    unknown = names -- existing
-
-    for name <- unknown do
-      IO.puts(:standard_error, "  Will create new store '#{name}'")
-    end
-
-    Enum.uniq(names)
   end
 
-  defp prompt_new_store_name do
-    IO.write(:standard_error, "New store name: ")
+  defp register(store_name) do
+    canonical = canonical_path()
+    projects = read_projects()
+    existing = Map.get(projects, canonical, [])
+    stores = Enum.uniq(existing ++ [store_name, "global"])
+    write_projects(Map.put(projects, canonical, stores))
+    :ok
+  end
 
-    case IO.read(:stdio, :line) do
-      line when is_binary(line) ->
-        name =
-          line
-          |> String.replace(~r/["']/, "")
-          |> String.trim()
-
-        case Store.validate_name(name) do
-          :ok -> name
-          {:error, reason} -> App.fatal(reason)
-        end
+  # Returns the canonical repo root for the current directory. Inside a git
+  # worktree, git-common-dir resolves to the main repo's .git directory, so
+  # all worktrees share the same store list. Falls back to CWD outside git.
+  def canonical_path do
+    case System.cmd("git", ["rev-parse", "--git-common-dir"], stderr_to_stdout: true) do
+      {path, 0} ->
+        path |> String.trim() |> Path.dirname() |> Path.expand()
 
       _ ->
-        App.fatal("No input received.")
+        File.cwd!()
     end
+  end
+
+  # Resolves store names for the current directory from projects.json.
+  # Returns ["global"] if the file doesn't exist or the directory isn't mapped.
+  def resolve_stores do
+    canonical = canonical_path()
+
+    if File.exists?(@projects_path) do
+      case File.read!(@projects_path) |> Jason.decode() do
+        {:ok, map} when is_map(map) -> Map.get(map, canonical, [])
+        _ -> []
+      end
+    else
+      []
+    end
+  end
+
+  defp read_projects do
+    if File.exists?(@projects_path) do
+      case File.read!(@projects_path) |> Jason.decode() do
+        {:ok, map} when is_map(map) -> map
+        _ -> %{}
+      end
+    else
+      %{}
+    end
+  end
+
+  defp write_projects(map) do
+    dir = Path.dirname(@projects_path)
+    File.mkdir_p!(dir)
+    File.write!(@projects_path, Jason.encode!(map, pretty: true) <> "\n")
   end
 end
 
@@ -2135,27 +1567,10 @@ case argv do
         App.fatal(reason)
     end
 
-  ["create", name] ->
+   ["create", name] ->
     case Store.create(name) do
       {:ok, name} ->
-        IO.puts(:standard_error, """
-        Created store '#{name}'.
-
-        To start the MCP server (with optional global store):
-          engram mcp #{name}
-          engram mcp #{name} global
-
-        To add to .mcp.json (recommended):
-          {
-            "mcpServers": {
-              "engram": {
-                "type": "stdio",
-                "command": "engram",
-                "args": ["mcp", "#{name}", "global"]
-              }
-            }
-          }
-        """)
+        App.info("Created store '#{name}'.")
 
       {:error, reason} ->
         App.error(reason)
@@ -2432,20 +1847,27 @@ case argv do
         App.fatal(reason)
     end
 
-  ["setup"] ->
-    Setup.run(App.script_path())
+  ["init", name] ->
+    Init.run(name)
 
-  ["mcp" | rest] when rest != [] ->
+  ["mcp" | rest] ->
     with :ok <- Store.open_db() do
-      # --all loads every store in the database; explicit names are validated
       stores =
-        if "--all" in rest do
-          case Store.list_stores() do
-            {:ok, all} -> all
-            _ -> App.fatal("Failed to list stores")
-          end
-        else
-          rest
+        cond do
+          rest == [] ->
+            case Init.resolve_stores() do
+              [] -> App.fatal("No stores configured. Run 'engram init <name>' first.")
+              names -> names
+            end
+
+          "--all" in rest ->
+            case Store.list_stores() do
+              {:ok, all} -> all
+              _ -> App.fatal("Failed to list stores")
+            end
+
+          true ->
+            rest
         end
 
       if stores == [], do: App.fatal("No stores found")
